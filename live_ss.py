@@ -652,25 +652,18 @@ def print_trade_summary(completed_trades):
         print("\nNo completed trades.")
         return
 
-    headers = ["Index", "Leg", "Strike", "Entry Time", "Exit Time",
+    headers = ["#", "Leg", "Strike", "Entry Time", "Exit Time",
                "Entry ₹", "Exit ₹", "Leg PnL (₹)", "Trade PnL (₹)"]
     rows = []
-    idx  = 1
-    for t in completed_trades:
-        rows.append([idx, "CE", t['ce_strike'],
+    for i, t in enumerate(completed_trades, start=1):
+        rows.append([i, "CE", t['ce_strike'],
                      t['ce_entry_time'], t['ce_exit_time'],
                      f"{t['ce_entry']:.2f}", f"{t['ce_exit']:.2f}",
                      f"{t['ce_pnl_val']:+.2f}", f"{t['trade_pnl_val']:+.2f}"])
-        idx += 1
-        rows.append([idx, "PE", t['pe_strike'],
+        rows.append(["", "PE", t['pe_strike'],
                      t['pe_entry_time'], t['pe_exit_time'],
                      f"{t['pe_entry']:.2f}", f"{t['pe_exit']:.2f}",
                      f"{t['pe_pnl_val']:+.2f}", ""])
-        idx += 1
-        rows.append(["──────"] * len(headers))
-
-    if rows and rows[-1][0] == "──────":
-        rows.pop()
 
     print("\n" + "=" * 100)
     print("  SESSION TRADE SUMMARY  (completed trades only)")

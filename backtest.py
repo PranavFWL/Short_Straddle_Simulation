@@ -75,41 +75,30 @@ def print_trade_summary(completed_trades):
         return
 
     headers = [
-        "Index", "Leg", "Strike",
+        "#", "Leg", "Strike",
         "Entry Time", "Exit Time",
         "Entry ₹", "Exit ₹",
         "Leg PnL (₹)", "Trade PnL (₹)"
     ]
 
     rows = []
-    idx  = 1  # sequential row number per leg
-
-    for t in completed_trades:
+    for i, t in enumerate(completed_trades, start=1):
         # CE row — Trade PnL shown here
         rows.append([
-            idx, "CE", t['ce_strike'],
+            i, "CE", t['ce_strike'],
             t['ce_entry_time'], t['ce_exit_time'],
             f"{t['ce_entry']:.2f}", f"{t['ce_exit']:.2f}",
             f"{t['ce_pnl_val']:+.2f}",
             f"{t['trade_pnl_val']:+.2f}",
         ])
-        idx += 1
-
-        # PE row — Trade PnL blank
+        # PE row — Trade PnL blank, # blank for clean look
         rows.append([
-            idx, "PE", t['pe_strike'],
+            "", "PE", t['pe_strike'],
             t['pe_entry_time'], t['pe_exit_time'],
             f"{t['pe_entry']:.2f}", f"{t['pe_exit']:.2f}",
             f"{t['pe_pnl_val']:+.2f}",
             "",
         ])
-        idx += 1
-
-        # Separator between trades
-        rows.append(["──────"] * len(headers))
-
-    if rows and rows[-1][0] == "──────":
-        rows.pop()
 
     print("\n" + "=" * 100)
     print("  BACKTEST TRADE SUMMARY  (completed trades only)")
@@ -164,6 +153,15 @@ def _load_from_combined_csv(date_str, entry_sql_time):
         (df['datetime'].dt.time >= entry_time_obj) &
         (df['datetime'].dt.time <= time(15, 15))
     ].sort_values('datetime').reset_index(drop=True)
+
+    # Drop first and last minute — T10 collector always produces an incomplete
+    # first candle (partial open minute) and the 15:15 candle is time-exit only.
+    if not df.empty:
+        all_minutes = sorted(df['datetime'].dt.strftime('%Y-%m-%d %H:%M').unique())
+        if len(all_minutes) > 2:
+            drop_minutes = {all_minutes[0], all_minutes[-1]}
+            df = df[~df['datetime'].dt.strftime('%Y-%m-%d %H:%M').isin(drop_minutes)]
+            df = df.reset_index(drop=True)
 
     if df.empty:
         return None, None
