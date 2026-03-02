@@ -340,6 +340,11 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
             # ── Build options lookup index ────────────────────────────────────
             opts_day['dt'] = pd.to_datetime(opts_day['datetime'])
+            # Deduplicate: CSV may have duplicate rows from collector reconnects.
+            # Keep last occurrence so index always returns a single row, not Series.
+            opts_day = opts_day.drop_duplicates(
+                subset=['dt', 'strike_price', 'option_type'], keep='last'
+            )
             opts_idx = opts_day.set_index(['dt', 'strike_price', 'option_type'])
 
             # ── Determine strike mode ─────────────────────────────────────────

@@ -511,17 +511,24 @@ CSV_COLUMNS = [
 ]
 
 class CSVWriter:
+    """
+    Writes option candle rows to CSV.
+    Tracks (datetime, option_type) keys already written — first write wins,
+    duplicates from reconnects are silently dropped.
+    """
 
     def __init__(self):
         self._lock     = threading.Lock()
         self._csv_path = None
         self._date_str = None
+        self._written  = set()   # {(datetime_str, option_type)}
 
     def _get_path(self) -> str:
         today = get_ist_time().strftime('%Y-%m-%d')
         if today != self._date_str:
             self._date_str = today
             self._csv_path = f"nifty_{today}.csv"
+            self._written.clear()
             if not os.path.exists(self._csv_path):
                 with open(self._csv_path, 'w', newline='') as f:
                     writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
@@ -534,11 +541,18 @@ class CSVWriter:
             return
         path = self._get_path()
         with self._lock:
-            with open(path, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS,
-                                        extrasaction='ignore')
-                writer.writerows(rows)
-        print(f"💾 Wrote {len(rows)} rows → {path}")
+            new_rows = []
+            for row in rows:
+                key = (row['datetime'], row['option_type'])
+                if key in self._written:
+                    continue
+                self._written.add(key)
+                new_rows.append(row)
+            if new_rows:
+                with open(path, 'a', newline='') as f:
+                    csv.DictWriter(f, fieldnames=CSV_COLUMNS,
+                                   extrasaction='ignore').writerows(new_rows)
+                print(f"💾 Wrote {len(new_rows)} rows → {path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
