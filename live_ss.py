@@ -385,6 +385,17 @@ class CSVWriter:
             if not os.path.exists(self._csv_path):
                 with open(self._csv_path, 'w', newline='') as f:
                     csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
+            else:
+                # File exists — check if it has a header; if not, prepend one
+                with open(self._csv_path, 'r', newline='') as f:
+                    first_line = f.readline()
+                if not first_line.startswith('datetime'):
+                    with open(self._csv_path, 'r', newline='') as f:
+                        existing = f.read()
+                    with open(self._csv_path, 'w', newline='') as f:
+                        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                        writer.writeheader()
+                        f.write(existing)
         return self._csv_path
 
     def flush(self, rows: list):
@@ -567,6 +578,8 @@ class FeedReader:
             return
         with open(self.csv_path, 'r', newline='') as f:
             for row in csv.DictReader(f):
+                if 'datetime' not in row:
+                    continue  # skip headerless / malformed rows
                 self._skip_minutes.add(row['datetime'][:16])
         self._initialized = True
 
@@ -580,6 +593,8 @@ class FeedReader:
         try:
             with open(self.csv_path, 'r', newline='') as f:
                 for row in csv.DictReader(f):
+                    if 'datetime' not in row:
+                        continue  # skip headerless / malformed rows
                     minute = row['datetime'][:16]
                     if minute in self._skip_minutes:
                         continue
