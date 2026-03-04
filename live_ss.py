@@ -28,11 +28,11 @@ from tabulate import tabulate
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Strategy
-ENTRY_TIME    = "09:16"
+ENTRY_TIME    = "10:38"
 EXIT_TIME     = "15:15"
 SL_POINTS     = 3
 TARGET_POINTS = 5
-LOT_SIZE      = 75
+LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
 # Collector
@@ -666,10 +666,12 @@ def print_trade_summary(completed_trades):
                      f"{t['pe_pnl_val']:+.2f}", ""])
 
     print("\n" + "=" * 100)
-    print("  SESSION TRADE SUMMARY  (completed trades only)")
+    print(f"  SESSION TRADE SUMMARY  ({len(completed_trades)} completed trades)")
     print("=" * 100)
-    print(tabulate(rows, headers=headers, tablefmt="rounded_outline",
-                   stralign="center", numalign="center"))
+    # Print line-by-line to prevent terminal buffering from swallowing rows
+    for line in tabulate(rows, headers=headers, tablefmt="rounded_outline",
+                         stralign="center", numalign="center").split("\n"):
+        print(line)
 
     total  = len(completed_trades)
     wins   = sum(1 for t in completed_trades if t['trade_pnl_val'] > 0)

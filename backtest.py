@@ -36,9 +36,9 @@ import glob
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
-SL_POINTS     = 3     # per leg: exit if candle HIGH >= entry + SL_POINTS
+SL_POINTS     = 3    # per leg: exit if candle HIGH >= entry + SL_POINTS
 TARGET_POINTS = 5     # combined: exit if (ce_entry-low) + (pe_entry-low) >= TARGET_POINTS
-LOT_SIZE      = 75
+LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
 CSV_COMBINED  = 'nifty_{date}.csv'
