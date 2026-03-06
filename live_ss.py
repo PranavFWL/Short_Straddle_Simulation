@@ -28,7 +28,7 @@ from tabulate import tabulate
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Strategy
-ENTRY_TIME    = "10:38"
+ENTRY_TIME    = "09:16"
 EXIT_TIME     = "15:15"
 SL_POINTS     = 3
 TARGET_POINTS = 5
@@ -260,10 +260,20 @@ class SpotStreamer:
                     self.shared.set_spot_open(closed['minute_dt'], closed['open'])
 
     def is_stale(self) -> bool:
+        # Don't check for staleness if not connected
+        if not self.is_connected:
+            self._snapshots.clear()
+            return False
+            
         ltp = self.candle._close or 0
         self._snapshots.append(ltp)
-        if len(self._snapshots) > 3: self._snapshots.pop(0)
-        return len(self._snapshots) == 3 and len(set(self._snapshots)) == 1
+        
+        # Increase threshold: 15 seconds of same value (15 snapshots @ 1/sec)
+        if len(self._snapshots) > 15: 
+            self._snapshots.pop(0)
+            
+        # Only return True if we have a full window of identical values
+        return len(self._snapshots) == 15 and len(set(self._snapshots)) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -350,11 +360,21 @@ class OptionStreamer:
         }
 
     def is_stale(self) -> bool:
+        # Don't check for staleness if not connected or no data received yet
+        if not self.is_connected or not self._market_ltp:
+            self._snapshots.clear()
+            return False
+            
         snap = dict(self._market_ltp)
         self._snapshots.append(snap)
-        if len(self._snapshots) > 3: self._snapshots.pop(0)
-        return (len(self._snapshots) == 3 and
-                self._snapshots[0] == self._snapshots[1] == self._snapshots[2])
+        
+        # Increase threshold: 15 seconds of same value (15 snapshots @ 1/sec)
+        if len(self._snapshots) > 15: 
+            self._snapshots.pop(0)
+            
+        # Only return True if we have a full window of identical values
+        return (len(self._snapshots) == 15 and
+                all(s == self._snapshots[0] for s in self._snapshots))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -509,33 +529,71 @@ class DataCollector:
             if spot_stream.is_stale():
                 spot_reconnects += 1
                 if spot_reconnects > MAX_RECONNECTS:
-                    print("❌ Max spot reconnects reached.")
+                    print(f"❌ Max spot reconnects ({MAX_RECONNECTS}) reached.")
                     break
                 print(f"🔄 Spot reconnect #{spot_reconnects}…")
-                spot_stream.disconnect()
+                try:
+                    spot_stream.disconnect()
+                except:
+                    pass
                 spot_stream.reset_snapshots()
+                
+                # Backoff delay
                 if spot_reconnects > 1:
-                    self._stop_event.wait(min(2 * (2 ** (spot_reconnects - 2)), 60))
+                    wait = min(2 * (2 ** (spot_reconnects - 2)), 60)
+                    print(f"⏳ Waiting {wait} seconds before spot reconnect...")
+                    self._stop_event.wait(wait)
+                
                 spot_stream.setup()
                 threading.Thread(target=spot_stream.connect, daemon=True).start()
+                
+                # IMPORTANT: Wait for connection to establish before checking again
+                print("⏳ Waiting for spot connection to establish…")
+                for _ in range(10): # Max 10 seconds
+                    if spot_stream.is_connected or self._stop_event.is_set():
+                        break
+                    time.sleep(1)
+                
                 if spot_stream.is_connected:
+                    print("✅ Spot connection restored.")
                     spot_reconnects = 0
+                else:
+                    print("⚠️  Spot connection failed to establish.")
 
             # Stale: options
             if opt_stream.is_stale():
                 opt_reconnects += 1
                 if opt_reconnects > MAX_RECONNECTS:
-                    print("❌ Max option reconnects reached.")
+                    print(f"❌ Max option reconnects ({MAX_RECONNECTS}) reached.")
                     break
                 print(f"🔄 Option reconnect #{opt_reconnects}…")
-                opt_stream.disconnect()
+                try:
+                    opt_stream.disconnect()
+                except:
+                    pass
                 opt_stream.reset_snapshots()
+                
+                # Backoff delay
                 if opt_reconnects > 1:
-                    self._stop_event.wait(min(2 * (2 ** (opt_reconnects - 2)), 60))
+                    wait = min(2 * (2 ** (opt_reconnects - 2)), 60)
+                    print(f"⏳ Waiting {wait} seconds before option reconnect...")
+                    self._stop_event.wait(wait)
+                    
                 opt_stream.setup()
                 threading.Thread(target=opt_stream.connect, daemon=True).start()
+                
+                # IMPORTANT: Wait for connection to establish before checking again
+                print("⏳ Waiting for option connection to establish…")
+                for _ in range(10): # Max 10 seconds
+                    if opt_stream.is_connected or self._stop_event.is_set():
+                        break
+                    time.sleep(1)
+                
                 if opt_stream.is_connected:
+                    print("✅ Option connection restored.")
                     opt_reconnects = 0
+                else:
+                    print("⚠️  Option connection failed to establish.")
 
             self._stop_event.wait(1)
 
