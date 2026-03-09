@@ -1,18 +1,3 @@
-"""
-Live Short Straddle Strategy
-=============================
-Single entry point — data collection and strategy run together.
-Run  : python live_strategy.py
-Stop : Ctrl+C  (prints full trade summary on exit)
-
-Strategy rules:
-  Entry   : OPEN of first candle at or after ENTRY_TIME
-  Target  : (ce_entry - low) + (pe_entry - low) >= TARGET_POINTS → exit at LOW
-  SL      : Either high >= leg_entry + SL_POINTS → exit at SL price
-  Re-entry: Next candle open after SL or Target (same fixed ATM strike)
-  Time    : 15:15 candle CLOSE, no re-entry
-"""
-
 import upstox_client
 import requests
 import threading

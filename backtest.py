@@ -8,36 +8,9 @@ import argparse
 import os
 import glob
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COMBINED CSV FORMAT
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#   Filename : nifty_YYYY-MM-DD.csv
-#   One row per strike per option_type per minute.
-#   Spot open is repeated on every row for that minute (denormalized).
-#
-#   REQUIRED COLUMNS (exact names, case-sensitive):
-#
-#   datetime      YYYY-MM-DD HH:MM:SS   Candle timestamp
-#   date          YYYY-MM-DD            Trading date
-#   spot_open     float                 Nifty50 spot candle open (e.g. 25463.35)
-#   expiry_date   YYYY-MM-DD            Option expiry date (e.g. 2026-03-02)
-#   strike_price  float                 Strike (e.g. 25450.0)
-#   option_type   string                Exactly 'CALL' or 'PUT'
-#   open          float                 Option candle open   → entry price
-#   high          float                 Option candle high   → SL check
-#   low           float                 Option candle low    → target check
-#   close         float                 Option candle close  → time exit
-#
-#   SAMPLE:
-#   datetime,date,spot_open,expiry_date,strike_price,option_type,open,high,low,close
-#   2026-02-25 09:16:00,2026-02-25,25463.35,2026-03-02,25450.0,CALL,166.85,167.20,166.45,166.90
-#   2026-02-25 09:16:00,2026-02-25,25463.35,2026-03-02,25450.0,PUT,136.55,137.25,136.45,137.25
-#
-# ─────────────────────────────────────────────────────────────────────────────
 
-SL_POINTS     = 3    # per leg: exit if candle HIGH >= entry + SL_POINTS
-TARGET_POINTS = 5     # combined: exit if (ce_entry-low) + (pe_entry-low) >= TARGET_POINTS
+SL_POINTS     = 3    
+TARGET_POINTS = 5   
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
@@ -246,11 +219,14 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
     Strategy: Short ATM Straddle with SL, Target, and Re-entry.
 
     Entry   : OPEN of first candle at or after entry_time_str
-    Target  : Checked on candle LOW first (priority)
-              (ce_entry - low) + (pe_entry - low) >= target_points
-              Both legs exit at LOW
-    SL      : Checked on candle HIGH second
-              Either HIGH >= leg_entry + sl_points → both exit at SL price
+    Target  : Combined drop across both legs >= target_points
+              Both legs exit at their candle LOW
+    SL      : Either leg's HIGH >= leg_entry + sl_points
+              Both legs exit at exact SL price
+    Conflict: If both Target and SL are hit in the same candle,
+              open-proximity heuristic decides which fired first —
+              whichever level price had less distance to travel
+              from the candle OPEN is treated as hit first.
     Re-entry: Next candle open immediately after SL or Target
     Time    : 15:15 candle CLOSE, no re-entry
 
@@ -438,31 +414,75 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 do_reenter  = False
 
                 if is_exit_candle:
-                    # Time exit — both legs at candle close
+                    # ── Time exit — both legs at candle close ─────────────────
                     exit_reason = 'Time'
                     ce_exit_px  = ce_close
                     pe_exit_px  = pe_close
 
                 else:
-                    # ── Target first (candle LOW) ─────────────────────────────
+                    # ── Evaluate target and SL simultaneously ─────────────────
+                    # Target: combined premium drop across both legs
+                    # SL    : either leg's high crosses its SL level
                     target_pts = (
                         (active['ce_entry'] - ce_low) +
                         (active['pe_entry'] - pe_low)
                     )
-                    if target_pts >= target_points:
+                    target_hit = target_pts >= target_points
+                    sl_hit     = (ce_high >= active['ce_sl'] or
+                                  pe_high >= active['pe_sl'])
+
+                    if target_hit and sl_hit:
+                        # ── Conflict: both hit in same candle ─────────────────
+                        # Open-proximity heuristic: whichever level price had
+                        # less distance to travel from the candle OPEN is
+                        # assumed to have been hit first.
+
+                        # SL distance: how far each triggered leg's open is
+                        # from its SL (price needs to rise to hit SL)
+                        ce_candle_open = float(ce_c['open'])
+                        pe_candle_open = float(pe_c['open'])
+                        sl_dists = []
+                        if ce_high >= active['ce_sl']:
+                            sl_dists.append(active['ce_sl'] - ce_candle_open)
+                        if pe_high >= active['pe_sl']:
+                            sl_dists.append(active['pe_sl'] - pe_candle_open)
+                        dist_to_sl = min(sl_dists)
+
+                        # Target distance: combined points still needed
+                        # after the candle open (price needs to fall)
+                        gain_at_open   = ((active['ce_entry'] - ce_candle_open) +
+                                          (active['pe_entry'] - pe_candle_open))
+                        dist_to_target = max(0.0, target_points - gain_at_open)
+
+                        if dist_to_sl <= dist_to_target:
+                            exit_reason = 'SL'
+                            ce_exit_px  = active['ce_sl']
+                            pe_exit_px  = active['pe_sl']
+                        else:
+                            exit_reason = 'Target'
+                            ce_exit_px  = ce_low
+                            pe_exit_px  = pe_low
+
+                        if not quiet:
+                            print(f"  ⚡ Conflict at {candle_dt.strftime('%H:%M')} — "
+                                  f"dist_to_sl={dist_to_sl:.2f}  "
+                                  f"dist_to_target={dist_to_target:.2f}  "
+                                  f"→ {exit_reason} wins")
+                        do_reenter = True
+
+                    elif target_hit:
+                        # ── Only target hit ───────────────────────────────────
                         exit_reason = 'Target'
                         ce_exit_px  = ce_low
                         pe_exit_px  = pe_low
                         do_reenter  = True
 
-                    else:
-                        # ── SL second (candle HIGH) ───────────────────────────
-                        if (ce_high >= active['ce_sl'] or
-                                pe_high >= active['pe_sl']):
-                            exit_reason = 'SL'
-                            ce_exit_px  = active['ce_sl']
-                            pe_exit_px  = active['pe_sl']
-                            do_reenter  = True
+                    elif sl_hit:
+                        # ── Only SL hit ───────────────────────────────────────
+                        exit_reason = 'SL'
+                        ce_exit_px  = active['ce_sl']
+                        pe_exit_px  = active['pe_sl']
+                        do_reenter  = True
 
                 # ── Close trade ───────────────────────────────────────────────
                 if exit_reason:
