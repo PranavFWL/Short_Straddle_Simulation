@@ -9,8 +9,8 @@ import os
 import glob
 
 
-SL_POINTS     = 10    
-TARGET_POINTS = 10   
+SL_POINTS     = 10
+TARGET_POINTS = 10
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
@@ -37,12 +37,6 @@ def _atm(spot):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_trade_summary(completed_trades):
-    """
-    Print final summary table after all dates are processed.
-    Two rows per trade (CE + PE) with sequential Index.
-    Columns: Index, Leg, Strike, Entry Time, Exit Time,
-             Entry ₹, Exit ₹, Leg PnL (₹), Trade PnL (₹)
-    """
     if not completed_trades:
         print("\nNo completed trades to display.")
         return
@@ -56,7 +50,6 @@ def print_trade_summary(completed_trades):
 
     rows = []
     for i, t in enumerate(completed_trades, start=1):
-        # CE row — Trade PnL shown here
         rows.append([
             i, "CE", t['ce_strike'],
             t['ce_entry_time'], t['ce_exit_time'],
@@ -64,7 +57,6 @@ def print_trade_summary(completed_trades):
             f"{t['ce_pnl_val']:+.2f}",
             f"{t['trade_pnl_val']:+.2f}",
         ])
-        # PE row — Trade PnL blank, # blank for clean look
         rows.append([
             "", "PE", t['pe_strike'],
             t['pe_entry_time'], t['pe_exit_time'],
@@ -79,7 +71,6 @@ def print_trade_summary(completed_trades):
     print(tabulate(rows, headers=headers, tablefmt="rounded_outline",
                    stralign="center", numalign="center"))
 
-    # Aggregate stats
     total_trades = len(completed_trades)
     wins         = sum(1 for t in completed_trades if t['trade_pnl_val'] > 0)
     losses       = total_trades - wins
@@ -103,10 +94,6 @@ def print_trade_summary(completed_trades):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_from_combined_csv(date_str, entry_sql_time):
-    """
-    Load nifty_YYYY-MM-DD.csv and split into spot_df and opts_df.
-    Returns (spot_df, opts_df) or (None, None) if file not found.
-    """
     csv_file = CSV_COMBINED.format(date=date_str)
     if not os.path.exists(csv_file):
         return None, None
@@ -127,8 +114,6 @@ def _load_from_combined_csv(date_str, entry_sql_time):
         (df['datetime'].dt.time <= time(15, 15))
     ].sort_values('datetime').reset_index(drop=True)
 
-    # Drop first and last minute — T10 collector always produces an incomplete
-    # first candle (partial open minute) and the 15:15 candle is time-exit only.
     if not df.empty:
         all_minutes = sorted(df['datetime'].dt.strftime('%Y-%m-%d %H:%M').unique())
         if len(all_minutes) > 2:
@@ -139,13 +124,11 @@ def _load_from_combined_csv(date_str, entry_sql_time):
     if df.empty:
         return None, None
 
-    # Spot: one row per minute
     spot_df = (df[['datetime', 'spot_open']]
                .drop_duplicates(subset='datetime')
                .rename(columns={'spot_open': 'open'})
                .reset_index(drop=True))
 
-    # Options: all rows
     opts_df = df[['datetime', 'expiry_date', 'strike_price',
                   'option_type', 'open', 'high', 'low', 'close']].copy()
 
@@ -153,9 +136,6 @@ def _load_from_combined_csv(date_str, entry_sql_time):
 
 
 def _load_from_db(con, date_str, entry_sql_time):
-    """
-    Load from DuckDB (fallback). Returns (spot_df, opts_df) or (None, None).
-    """
     expiry_res = con.execute(f"""
         SELECT MIN(expiry_date) FROM options_data
         WHERE date = '{date_str}' AND expiry_date >= '{date_str}'
@@ -211,27 +191,31 @@ def _get_db_dates(con):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN BACKTEST
+#
+# KEY DESIGN DECISIONS (aligned with live_strategy.py):
+#
+# 1. FIXED STRIKE per day:
+#    CSV path  — uses the single strike present in the CSV (from T10 collector)
+#    DB path   — locks to ATM of the FIRST candle of the day, never recalculates
+#    Both match live which locks ATM once at session start.
+#
+# 2. EXIT PRICES (no slippage):
+#    Target → ce_low, pe_low  (exact level crossed, same as live)
+#    SL     → ce_sl, pe_sl    (exact level, same as live)
+#    Time   → candle close    (live PnL, same as live)
+#
+# 3. CONFLICT RESOLUTION:
+#    Open-proximity heuristic — identical to live_strategy.py
+#
+# 4. RE-ENTRY:
+#    Immediate next candle after SL/Target exit.
+#    Since candles are 1-minute, this equals "next minute boundary" —
+#    same as live which gates re-entry to (exit_candle_minute + 1 min).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                  target_points=TARGET_POINTS, date_filter=None, quiet=False):
-    """
-    Strategy: Short ATM Straddle with SL, Target, and Re-entry.
 
-    Entry   : OPEN of first candle at or after entry_time_str
-    Target  : Combined drop across both legs >= target_points
-              Both legs exit at their candle LOW
-    SL      : Either leg's HIGH >= leg_entry + sl_points
-              Both legs exit at exact SL price
-    Conflict: If both Target and SL are hit in the same candle,
-              open-proximity heuristic decides which fired first —
-              whichever level price had less distance to travel
-              from the candle OPEN is treated as hit first.
-    Re-entry: Next candle open immediately after SL or Target
-    Time    : 15:15 candle CLOSE, no re-entry
-
-    Data    : nifty_YYYY-MM-DD.csv (combined) → DuckDB fallback
-    """
     try:
         entry_h, entry_m = map(int, entry_time_str.split(':'))
         entry_sql_time   = f"{entry_time_str}:00"
@@ -246,7 +230,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
             print("Invalid date format. Use YYYY-MM-DD")
             return pd.DataFrame(), []
 
-    # ── Build date → source list ──────────────────────────────────────────────
+    # ── Build date → source list ───────────────────────────────────────────────
     date_sources = []
 
     if date_filter:
@@ -273,7 +257,6 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
         print("No data found. Check CSV files or DuckDB.")
         return pd.DataFrame(), []
 
-    # Open DB only if needed
     con = None
     if any(s == 'db' for _, s in date_sources):
         if os.path.exists(DB_FILE):
@@ -292,12 +275,11 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
         print(f"           : Lot    = {LOT_SIZE}\n")
 
     daily_results    = []
-    completed_trades = []   # one dict per closed straddle
+    completed_trades = []
     trade_counter    = 0
 
     for date_str, source in date_sources:
         try:
-            # ── Load data ─────────────────────────────────────────────────────
             if source == 'csv':
                 spot_day, opts_day = _load_from_combined_csv(date_str, entry_sql_time)
             else:
@@ -312,25 +294,25 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     print(f"  ⚠️  No options data for {date_str} from {entry_time_str}")
                 continue
 
-            # ── Build options lookup index ────────────────────────────────────
             opts_day['dt'] = pd.to_datetime(opts_day['datetime'])
-            # Deduplicate: CSV may have duplicate rows from collector reconnects.
-            # Keep last occurrence so index always returns a single row, not Series.
             opts_day = opts_day.drop_duplicates(
                 subset=['dt', 'strike_price', 'option_type'], keep='last'
             )
             opts_idx = opts_day.set_index(['dt', 'strike_price', 'option_type'])
 
-            # ── Determine strike mode ─────────────────────────────────────────
-            # CSV from T10 has one fixed strike for the whole session.
-            # DB data may have multiple strikes — use ATM calc per candle.
+            # ── Strike mode ────────────────────────────────────────────────────
+            # CSV: one fixed strike for whole day (from T10 collector)
+            # DB : lock to ATM of first candle — never recalculate mid-session.
+            #      This matches live which locks ATM once at session start.
             unique_strikes = opts_day['strike_price'].unique()
             if source == 'csv' and len(unique_strikes) == 1:
                 fixed_strike = float(unique_strikes[0])
                 if not quiet:
                     print(f"  🔒 Fixed strike from CSV: {fixed_strike}")
             else:
-                fixed_strike = None   # calculate ATM per candle (DB path)
+                # DB path: will be set from the first candle's spot open
+                fixed_strike     = None
+                day_first_strike = None  # locked once, never changed
 
             def get_candle(candle_dt, strike, opt_type):
                 try:
@@ -338,8 +320,8 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 except KeyError:
                     return None
 
-            # ── Per-day state ─────────────────────────────────────────────────
-            active     = None   # open straddle dict, None when flat
+            # ── Per-day state ──────────────────────────────────────────────────
+            active     = None
             day_trades = []
 
             for _, spot_row in spot_day.iterrows():
@@ -348,23 +330,35 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 candle_time    = candle_dt.time()
                 is_exit_candle = (candle_time == time(15, 15))
 
+                # ── Determine strike to use ────────────────────────────────────
+                # CSV: always fixed_strike
+                # DB : lock on first candle (matches live locking ATM at open)
+                if source == 'csv':
+                    strike_to_use = fixed_strike
+                else:
+                    if day_first_strike is None:
+                        # Lock strike from first candle's spot — never changes
+                        day_first_strike = _atm(spot_open)
+                        if not quiet:
+                            print(f"  🔒 Fixed strike from DB (first candle): "
+                                  f"{day_first_strike}")
+                    strike_to_use = day_first_strike
+
                 # ── Open trade (initial or re-entry) ──────────────────────────
                 if active is None:
-                    # Fixed strike from CSV, or ATM calc for DB
-                    strike = fixed_strike if fixed_strike is not None else _atm(spot_open)
-                    ce_c   = get_candle(candle_dt, strike, 'CALL')
-                    pe_c   = get_candle(candle_dt, strike, 'PUT')
+                    ce_c = get_candle(candle_dt, strike_to_use, 'CALL')
+                    pe_c = get_candle(candle_dt, strike_to_use, 'PUT')
                     if ce_c is None or pe_c is None:
                         if not quiet:
-                            print(f"  ⚠️  No candle for strike {strike} at "
+                            print(f"  ⚠️  No candle for strike {strike_to_use} at "
                                   f"{candle_dt.strftime('%H:%M')} — skipping")
                         continue
 
                     trade_counter += 1
                     active = {
                         'trade_num'     : trade_counter,
-                        'ce_strike'     : strike,
-                        'pe_strike'     : strike,
+                        'ce_strike'     : strike_to_use,
+                        'pe_strike'     : strike_to_use,
                         'ce_entry'      : float(ce_c['open']),
                         'pe_entry'      : float(pe_c['open']),
                         'ce_entry_time' : candle_dt.strftime('%H:%M'),
@@ -376,23 +370,30 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     if not quiet:
                         print(f"  ➤ TRADE #{trade_counter} OPEN  "
                               f"[{date_str} {candle_dt.strftime('%H:%M')}] "
-                              f"CE {strike} @ {active['ce_entry']:.2f}  "
-                              f"PE {strike} @ {active['pe_entry']:.2f}")
+                              f"CE {strike_to_use} @ {active['ce_entry']:.2f}  "
+                              f"PE {strike_to_use} @ {active['pe_entry']:.2f}")
 
-                # ── Fetch current candles for active trade ────────────────────
+                    # Skip SL/Target check on entry candle
+                    # (same behaviour as live: entry candle open → don't check
+                    #  SL/Target until the NEXT candle completes)
+                    continue
+
+                # ── Fetch current candles for active trade ─────────────────────
                 ce_c = get_candle(candle_dt, active['ce_strike'], 'CALL')
                 pe_c = get_candle(candle_dt, active['pe_strike'], 'PUT')
                 if ce_c is None or pe_c is None:
                     continue
 
-                ce_high  = float(ce_c['high'])
-                ce_low   = float(ce_c['low'])
-                ce_close = float(ce_c['close'])
-                pe_high  = float(pe_c['high'])
-                pe_low   = float(pe_c['low'])
-                pe_close = float(pe_c['close'])
+                ce_open_c = float(ce_c['open'])
+                ce_high   = float(ce_c['high'])
+                ce_low    = float(ce_c['low'])
+                ce_close  = float(ce_c['close'])
+                pe_open_c = float(pe_c['open'])
+                pe_high   = float(pe_c['high'])
+                pe_low    = float(pe_c['low'])
+                pe_close  = float(pe_c['close'])
 
-                # ── Per-minute display ────────────────────────────────────────
+                # ── Per-minute display ─────────────────────────────────────────
                 if not quiet:
                     ce_pts         = _leg_pnl(active['ce_entry'], ce_close)
                     pe_pts         = _leg_pnl(active['pe_entry'], pe_close)
@@ -414,15 +415,12 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 do_reenter  = False
 
                 if is_exit_candle:
-                    # ── Time exit — both legs at candle close ─────────────────
                     exit_reason = 'Time'
                     ce_exit_px  = ce_close
                     pe_exit_px  = pe_close
 
                 else:
-                    # ── Evaluate target and SL simultaneously ─────────────────
-                    # Target: combined premium drop across both legs
-                    # SL    : either leg's high crosses its SL level
+                    # ── Target and SL on completed candle ──────────────────────
                     target_pts = (
                         (active['ce_entry'] - ce_low) +
                         (active['pe_entry'] - pe_low)
@@ -432,26 +430,16 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                                   pe_high >= active['pe_sl'])
 
                     if target_hit and sl_hit:
-                        # ── Conflict: both hit in same candle ─────────────────
-                        # Open-proximity heuristic: whichever level price had
-                        # less distance to travel from the candle OPEN is
-                        # assumed to have been hit first.
-
-                        # SL distance: how far each triggered leg's open is
-                        # from its SL (price needs to rise to hit SL)
-                        ce_candle_open = float(ce_c['open'])
-                        pe_candle_open = float(pe_c['open'])
+                        # ── Conflict: open-proximity heuristic ─────────────────
                         sl_dists = []
                         if ce_high >= active['ce_sl']:
-                            sl_dists.append(active['ce_sl'] - ce_candle_open)
+                            sl_dists.append(active['ce_sl'] - ce_open_c)
                         if pe_high >= active['pe_sl']:
-                            sl_dists.append(active['pe_sl'] - pe_candle_open)
+                            sl_dists.append(active['pe_sl'] - pe_open_c)
                         dist_to_sl = min(sl_dists)
 
-                        # Target distance: combined points still needed
-                        # after the candle open (price needs to fall)
-                        gain_at_open   = ((active['ce_entry'] - ce_candle_open) +
-                                          (active['pe_entry'] - pe_candle_open))
+                        gain_at_open   = ((active['ce_entry'] - ce_open_c) +
+                                          (active['pe_entry'] - pe_open_c))
                         dist_to_target = max(0.0, target_points - gain_at_open)
 
                         if dist_to_sl <= dist_to_target:
@@ -471,20 +459,17 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                         do_reenter = True
 
                     elif target_hit:
-                        # ── Only target hit ───────────────────────────────────
                         exit_reason = 'Target'
                         ce_exit_px  = ce_low
                         pe_exit_px  = pe_low
                         do_reenter  = True
 
                     elif sl_hit:
-                        # ── Only SL hit ───────────────────────────────────────
                         exit_reason = 'SL'
                         ce_exit_px  = active['ce_sl']
                         pe_exit_px  = active['pe_sl']
                         do_reenter  = True
 
-                # ── Close trade ───────────────────────────────────────────────
                 if exit_reason:
                     ce_pnl_pts = _leg_pnl(active['ce_entry'], ce_exit_px)
                     pe_pnl_pts = _leg_pnl(active['pe_entry'], pe_exit_px)
@@ -527,9 +512,9 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
                     if not do_reenter:
                         break   # time exit — done for this day
-                    # SL/Target: active=None, loop continues to next candle
+                    # SL/Target: active=None, loop continues to NEXT candle (re-entry)
 
-            # ── Daily PnL ─────────────────────────────────────────────────────
+            # ── Daily PnL ──────────────────────────────────────────────────────
             day_pnl = sum(t['trade_pnl_val'] for t in day_trades)
             if day_trades:
                 daily_results.append({
@@ -546,7 +531,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
     if con:
         con.close()
 
-    # ── Equity curve & reporting ──────────────────────────────────────────────
+    # ── Equity curve & reporting ───────────────────────────────────────────────
     res_df = pd.DataFrame(daily_results)
 
     if not res_df.empty:
@@ -568,7 +553,6 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
             res_df.to_csv('backtest_results.csv', index=False)
             print("\n  Results → backtest_results.csv")
 
-            # Monthly PnL table (only for multi-day runs)
             if len(res_df) > 1:
                 res_df['date'] = pd.to_datetime(res_df['date'])
                 monthly = (res_df.set_index('date')
@@ -612,7 +596,6 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 pivot_pct.to_csv('monthly_pnl_matrix.csv')
                 print("  Monthly matrix → monthly_pnl_matrix.csv")
 
-                # Equity & drawdown chart
                 plt.figure(figsize=(12, 8))
                 plt.subplot(2, 1, 1)
                 plt.plot(res_df['date'], res_df['cumulative_pnl'],
@@ -632,7 +615,6 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 plt.savefig('backtest_performance.png')
                 print("  Chart → backtest_performance.png")
 
-            # ── Final trade summary table (printed last) ──────────────────────
             print_trade_summary(completed_trades)
 
     else:
@@ -647,26 +629,14 @@ if __name__ == "__main__":
         description='Short Straddle Backtest (SL + Target + Re-entry)',
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument(
-        '--time', type=str, default='09:16',
-        help='Entry time HH:MM (default 09:16)\n'
-             'Also acts as session start — candles before this are ignored\n'
-             'Example: --time 14:55'
-    )
-    parser.add_argument(
-        '--sl', type=int, default=SL_POINTS,
-        help=f'SL points per leg (default {SL_POINTS})'
-    )
-    parser.add_argument(
-        '--target', type=int, default=TARGET_POINTS,
-        help=f'Target combined pts (default {TARGET_POINTS})'
-    )
-    parser.add_argument(
-        '--date', type=str, default=None,
-        help='Filter to single date YYYY-MM-DD (default: all dates)\n'
-             'Combined CSV checked first, DuckDB used as fallback\n'
-             'Example: --date 2026-02-25'
-    )
+    parser.add_argument('--time', type=str, default='09:16',
+                        help='Entry time HH:MM (default 09:16)')
+    parser.add_argument('--sl', type=int, default=SL_POINTS,
+                        help=f'SL points per leg (default {SL_POINTS})')
+    parser.add_argument('--target', type=int, default=TARGET_POINTS,
+                        help=f'Target combined pts (default {TARGET_POINTS})')
+    parser.add_argument('--date', type=str, default=None,
+                        help='Filter to single date YYYY-MM-DD (default: all dates)')
     args = parser.parse_args()
     run_backtest(
         entry_time_str=args.time,
