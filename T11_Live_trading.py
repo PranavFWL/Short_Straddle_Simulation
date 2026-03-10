@@ -13,9 +13,9 @@ from tabulate import tabulate
 
 # Strategy
 ENTRY_TIME    = "09:16"
-EXIT_TIME     = "15:15"
-SL_POINTS     = 3
-TARGET_POINTS = 5
+EXIT_TIME     = "15:30"
+SL_POINTS     = 10
+TARGET_POINTS = 10
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 

@@ -33,9 +33,9 @@ from urllib.parse import urlencode, parse_qs, urlparse
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-LOT_SIZE      = 75
 TOKEN_FILE    = 'upstox_token.txt'
 CACHE_FILE    = 'option_chain_cache.pkl'
+MAX_RECONNECTS = 10
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -347,13 +347,16 @@ class SpotStreamer:
                               f"O={closed['open']:.2f}")
 
     def is_stale(self) -> bool:
+        if not self.is_connected:
+            self._snapshots.clear()
+            return False
+
         ltp = self.candle._close or 0
         self._snapshots.append(ltp)
-        if len(self._snapshots) > 3:
+        if len(self._snapshots) > 15:
             self._snapshots.pop(0)
-        if len(self._snapshots) < 3:
-            return False
-        return self._snapshots[0] == self._snapshots[1] == self._snapshots[2]
+
+        return len(self._snapshots) == 15 and len(set(self._snapshots)) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -492,13 +495,17 @@ class OptionStreamer:
         }
 
     def is_stale(self) -> bool:
+        if not self.is_connected or not self._market_ltp:
+            self._snapshots.clear()
+            return False
+
         snap = dict(self._market_ltp)
         self._snapshots.append(snap)
-        if len(self._snapshots) > 3:
+        if len(self._snapshots) > 15:
             self._snapshots.pop(0)
-        if len(self._snapshots) < 3:
-            return False
-        return (self._snapshots[0] == self._snapshots[1] == self._snapshots[2])
+
+        return (len(self._snapshots) == 15 and
+                all(s == self._snapshots[0] for s in self._snapshots))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -559,34 +566,46 @@ class CSVWriter:
 # RECONNECT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _reconnect_spot(spot_stream: SpotStreamer, attempt: int):
+def _reconnect_spot(spot_stream: SpotStreamer, stop_event: threading.Event, attempt: int):
     print(f"🔄 Spot reconnect attempt {attempt}…")
-    spot_stream.disconnect()
+    try:
+        spot_stream.disconnect()
+    except Exception:
+        pass
     spot_stream.reset_snapshots()
     if attempt > 1:
         delay = min(2 * (2 ** (attempt - 2)), 60)
         print(f"⏳ Waiting {delay}s…")
-        time.sleep(delay)
+        stop_event.wait(delay)
     spot_stream.setup()
-    t = threading.Thread(target=spot_stream.connect, daemon=True)
-    t.start()
-    time.sleep(5)
-    return t
+    threading.Thread(target=spot_stream.connect, daemon=True).start()
+
+    # Wait for connection
+    for _ in range(10):
+        if spot_stream.is_connected or stop_event.is_set():
+            break
+        time.sleep(1)
 
 
-def _reconnect_option(opt_stream: OptionStreamer, attempt: int):
+def _reconnect_option(opt_stream: OptionStreamer, stop_event: threading.Event, attempt: int):
     print(f"🔄 Option reconnect attempt {attempt}…")
-    opt_stream.disconnect()
+    try:
+        opt_stream.disconnect()
+    except Exception:
+        pass
     opt_stream.reset_snapshots()
     if attempt > 1:
         delay = min(2 * (2 ** (attempt - 2)), 60)
         print(f"⏳ Waiting {delay}s…")
-        time.sleep(delay)
+        stop_event.wait(delay)
     opt_stream.setup()
-    t = threading.Thread(target=opt_stream.connect, daemon=True)
-    t.start()
-    time.sleep(5)
-    return t
+    threading.Thread(target=opt_stream.connect, daemon=True).start()
+
+    # Wait for connection
+    for _ in range(10):
+        if opt_stream.is_connected or stop_event.is_set():
+            break
+        time.sleep(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -691,11 +710,11 @@ def main():
     rows_written    = 0
     last_log        = time.time()
 
-    print(f"\n🔄 Collecting 1-min candles for ATM {atm_strike} "
-          f"(CALL + PUT)… Press Ctrl+C to stop.\n")
+    # Stop event for clean exit and wait synchronization
+    stop_event = threading.Event()
 
     try:
-        while True:
+        while not stop_event.is_set():
             # ── Market-close guard ─────────────────────────────────────────────
             now = get_ist_time()
             if now.hour > 15 or (now.hour == 15 and now.minute >= 30):
@@ -721,26 +740,28 @@ def main():
             # ── Stale: spot ───────────────────────────────────────────────────
             if spot_stream.is_stale():
                 spot_reconnects += 1
-                print(f"\n⚠️  Spot stale — reconnect #{spot_reconnects}")
-                if spot_reconnects > max_reconnects:
-                    print("❌ Max spot reconnects reached.")
+                if spot_reconnects > MAX_RECONNECTS:
+                    print(f"❌ Max spot reconnects ({MAX_RECONNECTS}) reached.")
                     break
-                spot_thread = _reconnect_spot(spot_stream, spot_reconnects)
+                _reconnect_spot(spot_stream, stop_event, spot_reconnects)
                 if spot_stream.is_connected:
+                    print("✅ Spot connection restored.")
                     spot_reconnects = 0
-                    print("✅ Spot reconnected.\n")
+                else:
+                    print("⚠️  Spot connection failed to establish.")
 
             # ── Stale: options ────────────────────────────────────────────────
             if opt_stream.is_stale():
                 opt_reconnects += 1
-                print(f"\n⚠️  Options stale — reconnect #{opt_reconnects}")
-                if opt_reconnects > max_reconnects:
-                    print("❌ Max option reconnects reached.")
+                if opt_reconnects > MAX_RECONNECTS:
+                    print(f"❌ Max option reconnects ({MAX_RECONNECTS}) reached.")
                     break
-                opt_thread = _reconnect_option(opt_stream, opt_reconnects)
+                _reconnect_option(opt_stream, stop_event, opt_reconnects)
                 if opt_stream.is_connected:
+                    print("✅ Option connection restored.")
                     opt_reconnects = 0
-                    print("✅ Options reconnected.\n")
+                else:
+                    print("⚠️  Option connection failed to establish.")
 
     except KeyboardInterrupt:
         print("\n\n👋 Ctrl+C — stopping…")
