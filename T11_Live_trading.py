@@ -382,7 +382,22 @@ class DataCollector:
         self.spot_at_open = spot_price
 
         print(f"\n🔒 ATM Strike : {atm_strike}  |  Spot: {spot_price:.2f}"
-              f"  |  Expiry: {expiry_date}\n")
+              f"  |  Expiry: {expiry_date}")
+
+        # Wait until the next full minute boundary before connecting.
+        # This ensures T10's WebSocket is fully up and its first candle has
+        # sealed before live strategy processes any candles — eliminating the
+        # 1-candle head-start that caused live to enter one minute early.
+        now         = get_ist_time()
+        next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+        wait_secs   = (next_minute - now).total_seconds()
+        print(f"⏳ Syncing to next minute boundary "
+              f"({next_minute.strftime('%H:%M:%S')} IST) — "
+              f"waiting {wait_secs:.1f}s…")
+        self._stop_event.wait(wait_secs)
+        if self._stop_event.is_set():
+            return
+        print(f"✅ Synced. Connecting WebSocket now.\n")
 
         opt_stream = OptionStreamer(self.access_token, atm_strike,
                                     atm_keys, expiry_date)
