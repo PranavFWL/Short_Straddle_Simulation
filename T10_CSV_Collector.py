@@ -25,6 +25,7 @@ import threading
 import time
 import csv
 import os
+import json
 import pickle
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode, parse_qs, urlparse
@@ -675,10 +676,23 @@ def main():
     atm_strike, spot_price = oc.get_atm_strike(full_chain)
     atm_keys               = oc.get_atm_instrument_keys(full_chain, atm_strike)
 
+    _session_state = {
+        'date'        : get_ist_time().strftime('%Y-%m-%d'),
+        'atm_strike'  : atm_strike,
+        'expiry_date' : expiry_date,
+        'atm_ce_key'  : atm_keys['CALL'],
+        'atm_pe_key'  : atm_keys['PUT'],
+        'spot_at_open': spot_price,
+    }
+    with open('session_state.json', 'w') as _f:
+        json.dump(_session_state, _f, indent=2)
+
     print(f"\n🔒 ATM Strike LOCKED: {atm_strike}  "
           f"(Spot at open: {spot_price:.2f})")
     print(f"   This strike will NOT change during the session.")
     print(f"   Expiry: {expiry_date}")
+    print(f"   ✅ session_state.json written — live_strategy will pick this up.")
+
 
     # ── Shared state & CSV writer ─────────────────────────────────────────────
     shared     = SharedState()

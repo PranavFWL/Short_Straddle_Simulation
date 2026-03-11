@@ -4,6 +4,10 @@ import threading
 import time
 import queue
 import pickle
+import subprocess
+import sys
+import os
+import json
 from datetime import datetime, timezone, timedelta, time as dt_time
 from tabulate import tabulate
 
@@ -18,15 +22,18 @@ TARGET_POINTS = 10
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
-TOKEN_FILE     = 'upstox_token.txt'
-CACHE_FILE     = 'option_chain_cache.pkl'
-MAX_RECONNECTS = 10
+TOKEN_FILE            = 'upstox_token.txt'
+CACHE_FILE            = 'option_chain_cache.pkl'
+COLLECTOR_FILE        = 'T10_CSV_Collector.py'  # launched as subprocess at startup
+SESSION_STATE         = 'session_state.json'    # written by T10 after ATM lock
+SESSION_STATE_TIMEOUT = 60                      # max seconds to wait for T10's ATM lock
+MAX_RECONNECTS        = 10
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED HELPERS
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_ist_time() -> datetime:
@@ -46,56 +53,71 @@ def _leg_pnl(entry, exit_price):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COLLECTOR LAUNCHER
+# Starts T10_CSV_Collector.py as a background subprocess.
+# Returns the Popen handle so it can be terminated on exit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def launch_collector() -> subprocess.Popen:
+    if not os.path.exists(COLLECTOR_FILE):
+        print(f"⚠️  {COLLECTOR_FILE} not found — CSV collection will not run.")
+        return None
+    env = os.environ.copy()
+    env['PYTHONUTF8'] = '1'          # force UTF-8 on Windows (fixes emoji/arrow encode errors)
+    proc = subprocess.Popen(
+        [sys.executable, '-X', 'utf8', COLLECTOR_FILE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        text=True,
+        encoding='utf-8',
+        env=env,
+    )
+    # Forward collector output to console in a daemon thread
+    def _forward():
+        for line in proc.stdout:
+            print(f"[T10] {line}", end='')
+    threading.Thread(target=_forward, daemon=True, name="CollectorLog").start()
+    print(f"🟢 T10_CSV_Collector started (PID {proc.pid})")
+    return proc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LIVE CANDLE BUILDER
-# Mirrors what T10_CSV_Collector does — accumulates ticks into 1-min OHLC.
-# Used by LiveStrategy to apply the same candle-level logic as backtest.
+#
+# KEY DESIGN — prev-close-as-open:
+#   When a minute rolls over, the new candle OPEN = previous candle CLOSE,
+#   not the first WebSocket tick of the new minute.
+#
+#   Why: The first tick of a new minute may arrive late or be stale.
+#   The previous candle's close is a confirmed last-traded price, matching
+#   what T10_CSV_Collector records as the candle open.
+#   This makes entry price and SL levels stable and consistent with backtest.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LiveCandleBuilder:
     """
     Accumulates (ce_ltp, pe_ltp) ticks into 1-minute OHLC candles.
-    On every tick, returns a completed candle if the minute just rolled over.
+    Returns a completed candle dict when the minute rolls over.
 
-    KEY DESIGN: The new candle's OPEN is set to the PREVIOUS candle's CLOSE,
-    not the first tick of the new minute. This mirrors how T10_CSV_Collector
-    records candle opens (first tick it receives), and more importantly ensures
-    that entry price and SL levels are based on a confirmed last-traded price
-    rather than a potentially late/stale first WebSocket tick of the new minute.
-
-    Example:
-        12:30 candle closes at 59.50 (CE) and 51.80 (PE)
-        12:31 candle open = 59.50 / 51.80  ← guaranteed, not first-tick-dependent
-        First tick of 12:31 (e.g. 61.10) updates high/low/close only
-
-    Fields in completed candle dict:
-        minute_dt       : naive datetime of that minute (floor to :00)
-        ce_open/high/low/close
-        pe_open/high/low/close
+    Fields: minute_dt, ce_open/high/low/close, pe_open/high/low/close
     """
 
     def __init__(self):
-        self._lock       = threading.Lock()
-        self._minute     = None   # current candle minute (datetime)
-        self._ce         = None   # {open, high, low, close}
-        self._pe         = None
+        self._lock   = threading.Lock()
+        self._minute = None
+        self._ce     = None
+        self._pe     = None
 
     def tick(self, ce_ltp: float, pe_ltp: float, ts: datetime):
-        """
-        Feed a tick. Returns completed candle dict if minute just rolled, else None.
-        """
         candle_min = ts.replace(second=0, microsecond=0, tzinfo=None)
 
         with self._lock:
             if self._minute is None:
-                # First tick ever — open first candle using this tick as open.
-                # No previous close exists yet, so this is unavoidable.
                 self._open_candle(candle_min, ce_ltp, pe_ltp)
                 return None
 
             if candle_min > self._minute:
-                # Minute rolled — seal the OLD candle.
-                # New candle OPEN = OLD candle CLOSE (last confirmed price).
-                # This is the fix: incoming tick LTP is NOT used as open.
                 ce_prev_close = self._ce['close']
                 pe_prev_close = self._pe['close']
 
@@ -110,21 +132,17 @@ class LiveCandleBuilder:
                     'pe_low'   : self._pe['low'],
                     'pe_close' : pe_prev_close,
                 }
-
-                # Open new candle with prev close as open, then update with
-                # the incoming tick (which may differ from prev close)
+                # New candle opens at prev close — not at incoming ltp
                 self._open_candle(candle_min, ce_prev_close, pe_prev_close)
-                # Now apply the incoming tick to update high/low/close
+                # Incoming tick updates high/low/close only
                 self._ce['high']  = max(self._ce['high'],  ce_ltp)
                 self._ce['low']   = min(self._ce['low'],   ce_ltp)
                 self._ce['close'] = ce_ltp
                 self._pe['high']  = max(self._pe['high'],  pe_ltp)
                 self._pe['low']   = min(self._pe['low'],   pe_ltp)
                 self._pe['close'] = pe_ltp
-
                 return sealed
 
-            # Same minute — update OHLC
             self._ce['high']  = max(self._ce['high'],  ce_ltp)
             self._ce['low']   = min(self._ce['low'],   ce_ltp)
             self._ce['close'] = ce_ltp
@@ -262,7 +280,6 @@ class OptionStreamer:
                     data['fullFeed']['marketFF'].get('ltpc', {}).get('ltp', 0))
             elif 'ltpc' in data:
                 ltp = _to_float(data['ltpc'].get('ltp', 0))
-
             if ltp > 0:
                 self._latest[otype] = ltp
 
@@ -318,39 +335,53 @@ class DataCollector:
             import traceback; traceback.print_exc()
 
     def _collect(self):
-        oc          = UpstoxOptionChain(self.access_token)
-        full_chain  = None
+        # ── Wait for T10_CSV_Collector to lock the ATM strike ─────────────────
+        # T10 writes session_state.json within seconds of startup (immediately
+        # after its own REST call completes). We wait for that file rather than
+        # making an independent REST call — this guarantees both systems use the
+        # exact same strike, expiry, and instrument keys.
+        today_str  = get_ist_time().strftime('%Y-%m-%d')
+        atm_strike = None
         expiry_date = None
+        atm_keys   = None
+        spot_price = 0.0
 
-        for attempt in range(1, 6):
+        print(f"⏳ Waiting for T10 to lock ATM strike "
+              f"(max {SESSION_STATE_TIMEOUT}s)…")
+
+        deadline = time.time() + SESSION_STATE_TIMEOUT
+        while time.time() < deadline:
             if self._stop_event.is_set():
                 return
-            try:
-                full_chain, expiry_date = oc.get_option_chain()
-                with open(CACHE_FILE, 'wb') as f:
-                    pickle.dump((full_chain, expiry_date), f)
-                break
-            except Exception as e:
-                print(f"⚠️  Option chain attempt {attempt}/5 failed: {str(e)[:80]}")
-                if attempt < 5:
-                    self._stop_event.wait(2 * attempt)
-                else:
-                    try:
-                        with open(CACHE_FILE, 'rb') as f:
-                            full_chain, expiry_date = pickle.load(f)
-                        print("✅ Using cached option chain.")
-                    except Exception:
-                        print("❌ No option chain data. Collector stopping.")
-                        return
+            if os.path.exists(SESSION_STATE):
+                try:
+                    with open(SESSION_STATE) as f:
+                        state = json.load(f)
+                    if state.get('date') == today_str:
+                        atm_strike  = state['atm_strike']
+                        expiry_date = state['expiry_date']
+                        atm_keys    = {'CALL': state['atm_ce_key'],
+                                       'PUT' : state['atm_pe_key']}
+                        spot_price  = float(state.get('spot_at_open', 0.0))
+                        print(f"✅ Session state loaded from T10:")
+                        print(f"   ATM Strike : {atm_strike}")
+                        print(f"   Expiry     : {expiry_date}")
+                        print(f"   Spot       : {spot_price:.2f}")
+                        break
+                except Exception as e:
+                    pass   # file may be mid-write, retry next loop
+            time.sleep(0.5)
 
-        atm_strike, spot_price = oc.get_atm_strike(full_chain)
-        atm_keys               = oc.get_atm_instrument_keys(full_chain, atm_strike)
+        if atm_strike is None:
+            print(f"❌ T10 did not write session state within "
+                  f"{SESSION_STATE_TIMEOUT}s. Cannot start strategy.")
+            return
 
         self.atm_strike   = atm_strike
         self.expiry_date  = expiry_date
         self.spot_at_open = spot_price
 
-        print(f"\n🔒 ATM Strike : {atm_strike}  |  Spot (open): {spot_price:.2f}"
+        print(f"\n🔒 ATM Strike : {atm_strike}  |  Spot: {spot_price:.2f}"
               f"  |  Expiry: {expiry_date}\n")
 
         opt_stream = OptionStreamer(self.access_token, atm_strike,
@@ -369,25 +400,19 @@ class DataCollector:
                     print(f"❌ Max option reconnects ({MAX_RECONNECTS}) reached.")
                     break
                 print(f"🔄 Option reconnect #{opt_reconnects}…")
-                try:
-                    opt_stream.disconnect()
-                except Exception:
-                    pass
+                try: opt_stream.disconnect()
+                except Exception: pass
                 opt_stream.reset_snapshots()
-
                 if opt_reconnects > 1:
                     wait = min(2 * (2 ** (opt_reconnects - 2)), 60)
                     self._stop_event.wait(wait)
-
                 opt_stream.set_tick_callback(self._tick_cb)
                 opt_stream.setup()
                 threading.Thread(target=opt_stream.connect, daemon=True).start()
-
                 for _ in range(10):
                     if opt_stream.is_connected or self._stop_event.is_set():
                         break
                     time.sleep(1)
-
                 if opt_stream.is_connected:
                     print("✅ Option connection restored.")
                     opt_reconnects = 0
@@ -445,37 +470,17 @@ def print_trade_summary(completed_trades):
 # ─────────────────────────────────────────────────────────────────────────────
 # LIVE STRATEGY
 #
-# KEY DESIGN DECISIONS (aligns with backtest exactly):
+# Receives ticks from DataCollector, builds 1-min candles via LiveCandleBuilder,
+# and applies strategy logic once per completed candle — identical to backtest.
 #
-# 1. CANDLE-LEVEL LOGIC:
-#    Ticks are accumulated into 1-min OHLC candles (same as T10 collector).
-#    SL / Target / Conflict checks happen once per COMPLETED candle — NOT
-#    per individual tick. This is identical to how backtest.py works.
-#
-# 2. EXIT PRICES (no slippage, exact levels):
-#    - Target hit : CE exits at (ce_entry - TARGET_POINTS/2)
-#                   PE exits at (pe_entry - TARGET_POINTS/2)
-#                   Combined PnL = exactly TARGET_POINTS pts (minus costs)
-#    - SL hit     : CE exits at ce_sl, PE exits at pe_sl
-#                   Combined PnL = exactly -SL_POINTS * 2 pts (minus costs)
-#    - Time exit  : exits at candle close (live PnL, varies)
-#
-#    NOTE: Target is a COMBINED trigger (both legs together must drop >= TARGET).
-#    Since we can't know per-leg exit in live, we split equally. This produces
-#    identical combined PnL to backtest, which is all that matters.
-#
-# 3. RE-ENTRY ON MINUTE BOUNDARY:
-#    After SL or Target exit, re-entry is blocked until the START of the next
-#    minute (:00 seconds), not 60s from exit timestamp. This ensures live
-#    enters on the same candle open as backtest.
-#
-# 4. CONFLICT RESOLUTION (Target + SL in same candle):
-#    Open-proximity heuristic — identical to backtest:
-#    Compare dist_to_sl vs dist_to_target from the candle open.
-#    Whichever is smaller fires first.
-#
-# 5. FIXED STRIKE:
-#    ATM strike is locked at session start from DataCollector. Never changes.
+#   Entry  : candle open (prev-close-as-open) of first eligible minute
+#   Target : (ce_entry - ce_low) + (pe_entry - pe_low) >= TARGET_POINTS
+#            → exit at ce_low / pe_low  (exact, no slippage)
+#   SL     : ce_high >= ce_sl OR pe_high >= pe_sl
+#            → exit at ce_sl / pe_sl   (exact, no slippage)
+#   Conflict: open-proximity heuristic (identical to backtest)
+#   Re-entry: start of next minute after SL/Target exit
+#   Time   : EXIT_TIME candle close
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LiveStrategy:
@@ -493,50 +498,33 @@ class LiveStrategy:
         self._latest_pe       = 0.0
         self._spot_at_open    = 0.0
         self._atm_strike      = None
-
-        # ── Candle builder: accumulates ticks → 1-min OHLC, same as T10 ──────
-        self._candle_builder  = LiveCandleBuilder()
-
-        # ── Re-entry gate: datetime at which next entry is allowed ────────────
-        # Set to the START of the next minute after exit (not ts + 60s).
         self._reentry_after   = None
-
-    # ── Tick callback ──────────────────────────────────────────────────────────
+        self._candle_builder  = LiveCandleBuilder()
 
     def on_tick(self, ce_ltp: float, pe_ltp: float, ts: datetime):
         self._tick_queue.put((ce_ltp, pe_ltp, ts))
 
-    # ── Trade lifecycle ────────────────────────────────────────────────────────
-
     def _open_trade(self, ce_open: float, pe_open: float, minute_dt: datetime):
-        """
-        Open a new straddle. Entry price = candle OPEN of the entry minute.
-        Identical to backtest which uses candle['open'] for entry.
-        """
         self.trade_counter += 1
         hhmm   = minute_dt.strftime('%H:%M')
         strike = self._atm_strike
         self.active = {
             'trade_num'     : self.trade_counter,
-            'ce_strike'     : strike,
-            'pe_strike'     : strike,
-            'ce_entry'      : ce_open,
-            'pe_entry'      : pe_open,
+            'ce_strike'     : strike,  'pe_strike'     : strike,
+            'ce_entry'      : ce_open, 'pe_entry'      : pe_open,
             'ce_sl'         : ce_open + SL_POINTS,
             'pe_sl'         : pe_open + SL_POINTS,
-            'ce_entry_time' : hhmm,
-            'pe_entry_time' : hhmm,
+            'ce_entry_time' : hhmm,    'pe_entry_time' : hhmm,
         }
-        print(f"\n  ➤ TRADE #{self.trade_counter} OPEN  "
-              f"[{hhmm}]  Strike {strike}  |  "
+        print(f"\n  ➤ TRADE #{self.trade_counter} OPEN  [{hhmm}]  Strike {strike}  |  "
               f"CE @ {ce_open:.2f}  SL {ce_open + SL_POINTS:.2f}  |  "
               f"PE @ {pe_open:.2f}  SL {pe_open + SL_POINTS:.2f}")
 
     def _close_trade(self, ce_exit: float, pe_exit: float,
                      reason: str, minute_dt: datetime):
-        t      = self.active
+        t    = self.active
         self.active = None
-        hhmm   = minute_dt.strftime('%H:%M')
+        hhmm = minute_dt.strftime('%H:%M')
 
         ce_pnl_pts = _leg_pnl(t['ce_entry'], ce_exit)
         pe_pnl_pts = _leg_pnl(t['pe_entry'], pe_exit)
@@ -546,13 +534,13 @@ class LiveStrategy:
 
         record = {
             'trade_num'     : t['trade_num'],
-            'ce_strike'     : t['ce_strike'], 'pe_strike'     : t['pe_strike'],
-            'ce_entry_time' : t['ce_entry_time'], 'ce_exit_time'  : hhmm,
-            'ce_entry'      : t['ce_entry'],  'ce_exit'       : ce_exit,
-            'ce_pnl_pts'    : ce_pnl_pts,     'ce_pnl_val'    : ce_pnl_val,
-            'pe_entry_time' : t['pe_entry_time'], 'pe_exit_time'  : hhmm,
-            'pe_entry'      : t['pe_entry'],  'pe_exit'       : pe_exit,
-            'pe_pnl_pts'    : pe_pnl_pts,     'pe_pnl_val'    : pe_pnl_val,
+            'ce_strike'     : t['ce_strike'],    'pe_strike'     : t['pe_strike'],
+            'ce_entry_time' : t['ce_entry_time'],'ce_exit_time'  : hhmm,
+            'ce_entry'      : t['ce_entry'],     'ce_exit'       : ce_exit,
+            'ce_pnl_pts'    : ce_pnl_pts,        'ce_pnl_val'    : ce_pnl_val,
+            'pe_entry_time' : t['pe_entry_time'],'pe_exit_time'  : hhmm,
+            'pe_entry'      : t['pe_entry'],     'pe_exit'       : pe_exit,
+            'pe_pnl_pts'    : pe_pnl_pts,        'pe_pnl_val'    : pe_pnl_val,
             'trade_pnl_pts' : ce_pnl_pts + pe_pnl_pts,
             'trade_pnl_val' : trade_val,
             'exit_reason'   : reason,
@@ -562,30 +550,14 @@ class LiveStrategy:
         print(f"\n  {icon} TRADE #{t['trade_num']} CLOSED  [{hhmm}]  {reason}  |  "
               f"CE exit {ce_exit:.2f}  PE exit {pe_exit:.2f}  |  "
               f"Trade PnL: ₹{trade_val:+.2f}")
-
-        return reason in ('SL', 'Target')   # True = re-entry allowed after cooldown
-
-    # ── Per-candle processor (called once per completed 1-min candle) ──────────
+        return reason in ('SL', 'Target')
 
     def _process_candle(self, candle: dict):
-        """
-        Applies strategy logic on a COMPLETED 1-minute candle.
-
-        This mirrors backtest.py exactly:
-          - Entry  : candle open of first eligible candle
-          - Target : (ce_entry - ce_low) + (pe_entry - pe_low) >= TARGET_POINTS
-                     → exit at exact target level (no slippage)
-          - SL     : ce_high >= ce_sl OR pe_high >= pe_sl
-                     → exit at exact SL level (no slippage)
-          - Conflict: open-proximity heuristic (same as backtest)
-          - Time   : exit candle → close price (live PnL)
-        """
-        minute_dt  = candle['minute_dt']        # naive datetime, floor to :00
-        hhmm       = minute_dt.strftime('%H:%M')
-        tick_time  = dt_time(minute_dt.hour, minute_dt.minute)
-
-        in_window  = self.entry_time <= tick_time < self.exit_time
-        is_exit    = tick_time >= self.exit_time
+        minute_dt = candle['minute_dt']
+        hhmm      = minute_dt.strftime('%H:%M')
+        tick_time = dt_time(minute_dt.hour, minute_dt.minute)
+        in_window = self.entry_time <= tick_time < self.exit_time
+        is_exit   = tick_time >= self.exit_time
 
         if not in_window and not is_exit:
             return
@@ -601,17 +573,10 @@ class LiveStrategy:
 
         # ── Entry ──────────────────────────────────────────────────────────────
         if self.active is None and in_window:
-            # Re-entry gate: must be at/after the allowed minute boundary
-            # _reentry_after is set to the START of the next minute after exit,
-            # so comparing minute_dt (candle start) is correct.
             if self._reentry_after and minute_dt < self._reentry_after:
                 return
-            # Enter at candle OPEN — same as backtest
             self._open_trade(ce_open, pe_open, minute_dt)
-            # Don't check SL/Target on the same candle as entry
-            # (backtest also skips: entry candle open is entry price,
-            #  SL/Target first evaluated from next candle onward)
-            return
+            return   # skip SL/Target on entry candle — same as backtest
 
         if self.active is None:
             return
@@ -629,21 +594,18 @@ class LiveStrategy:
             pe_exit_px  = pe_close
 
         else:
-            # ── Evaluate Target and SL on completed candle ─────────────────────
-            # Identical formulas to backtest.py:
             target_pts = (t['ce_entry'] - ce_low) + (t['pe_entry'] - pe_low)
             target_hit = target_pts >= TARGET_POINTS
             sl_hit     = (ce_high >= t['ce_sl'] or pe_high >= t['pe_sl'])
 
             if target_hit and sl_hit:
-                # ── Conflict: open-proximity heuristic (identical to backtest) ─
+                # Open-proximity conflict heuristic — identical to backtest
                 sl_dists = []
                 if ce_high >= t['ce_sl']:
                     sl_dists.append(t['ce_sl'] - ce_open)
                 if pe_high >= t['pe_sl']:
                     sl_dists.append(t['pe_sl'] - pe_open)
-                dist_to_sl = min(sl_dists)
-
+                dist_to_sl     = min(sl_dists)
                 gain_at_open   = (t['ce_entry'] - ce_open) + (t['pe_entry'] - pe_open)
                 dist_to_target = max(0.0, TARGET_POINTS - gain_at_open)
 
@@ -656,24 +618,18 @@ class LiveStrategy:
                     ce_exit_px  = ce_low
                     pe_exit_px  = pe_low
 
-                print(f"  ⚡ Conflict [{hhmm}] — "
-                      f"dist_to_sl={dist_to_sl:.2f}  "
-                      f"dist_to_target={dist_to_target:.2f}  "
-                      f"→ {exit_reason} wins")
+                print(f"  ⚡ Conflict [{hhmm}] dist_to_sl={dist_to_sl:.2f}  "
+                      f"dist_to_target={dist_to_target:.2f}  → {exit_reason} wins")
                 do_reenter = True
 
             elif target_hit:
                 exit_reason = 'Target'
-                # Exit at exact target — no slippage.
-                # Backtest uses ce_low / pe_low (which crossed the target).
-                # Live uses the same: ce_low / pe_low from the live candle.
                 ce_exit_px  = ce_low
                 pe_exit_px  = pe_low
                 do_reenter  = True
 
             elif sl_hit:
                 exit_reason = 'SL'
-                # Exit at exact SL price — no slippage. Same as backtest.
                 ce_exit_px  = t['ce_sl']
                 pe_exit_px  = t['pe_sl']
                 do_reenter  = True
@@ -682,28 +638,20 @@ class LiveStrategy:
             needs_reentry = self._close_trade(ce_exit_px, pe_exit_px,
                                               exit_reason, minute_dt)
             if needs_reentry:
-                # ── Re-entry gate: START of the next minute ────────────────────
-                # Example: trade exits at candle 09:24 (minute_dt = 09:24:00)
-                # → _reentry_after = 09:25:00
-                # → next candle with minute_dt >= 09:25:00 is eligible for entry
-                # This is identical to backtest "next candle" re-entry.
                 self._reentry_after = minute_dt + timedelta(minutes=1)
-
             if not do_reenter:
                 self.session_done = True
 
-    # ── Per-minute status ──────────────────────────────────────────────────────
-
-    def _print_status(self, hhmm: str):
+    def _print_status(self):
         now        = get_ist_time().strftime('%H:%M:%S')
         closed_pnl = sum(t['trade_pnl_val'] for t in self.completed_trades)
         ce_ltp     = self._latest_ce
         pe_ltp     = self._latest_pe
 
         if self.active:
-            t        = self.active
-            open_pnl = (_leg_pnl(t['ce_entry'], ce_ltp or t['ce_entry']) +
-                        _leg_pnl(t['pe_entry'], pe_ltp or t['pe_entry'])) * LOT_SIZE
+            t         = self.active
+            open_pnl  = (_leg_pnl(t['ce_entry'], ce_ltp or t['ce_entry']) +
+                         _leg_pnl(t['pe_entry'], pe_ltp or t['pe_entry'])) * LOT_SIZE
             total_pnl = closed_pnl + open_pnl
             pos_str   = (f"Trade#{t['trade_num']} ACTIVE  "
                          f"CE {t['ce_strike']} LTP {ce_ltp:.2f}  "
@@ -713,19 +661,16 @@ class LiveStrategy:
             total_pnl = closed_pnl
             pos_str   = "No active position"
 
-        print(f"  [{now}]  Spot (open) {self._spot_at_open:.2f}  |  "
+        print(f"  [{now}]  ATM {self._atm_strike}  |  "
               f"Trades {len(self.completed_trades)}  |  "
               f"Session PnL ₹{total_pnl:+.2f}  |  {pos_str}")
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
-
-    def run(self, collector: DataCollector):
+    def run(self, collector: DataCollector, collector_proc: subprocess.Popen):
         print("\n" + "=" * 65)
         print("  🚀  LIVE SHORT STRADDLE  (candle-aligned, backtest-matched)")
         print(f"  Entry  : {ENTRY_TIME}    Exit   : {EXIT_TIME}")
         print(f"  SL     : {SL_POINTS} pts/leg    Target : {TARGET_POINTS} pts combined")
         print(f"  Lot    : {LOT_SIZE}")
-        print("  Logic  : 1-min candles | exact SL/Target | minute-boundary re-entry")
         print("=" * 65)
 
         collector.set_tick_callback(self.on_tick)
@@ -737,7 +682,7 @@ class LiveStrategy:
 
         self._atm_strike   = collector.atm_strike
         self._spot_at_open = collector.spot_at_open
-        print(f"✅ Stream active. ATM Strike locked: {self._atm_strike}. Strategy running.\n")
+        print(f"✅ Stream active. ATM Strike: {self._atm_strike}. Strategy running.\n")
 
         last_status_minute = None
 
@@ -746,26 +691,19 @@ class LiveStrategy:
                 now      = get_ist_time()
                 now_hhmm = now.strftime('%H:%M')
 
-                # Hard market-close guard
                 if now.hour > 15 or (now.hour == 15 and now.minute >= 31):
                     print("\n🏁 Session complete.")
                     break
 
-                # Drain tick queue — feed each tick into candle builder
+                # Drain tick queue → feed into candle builder
                 try:
                     while True:
                         ce_ltp, pe_ltp, ts = self._tick_queue.get_nowait()
-
-                        # Track latest LTP for status display
                         self._latest_ce = ce_ltp
                         self._latest_pe = pe_ltp
-
-                        # Feed tick into candle builder
-                        # Returns a completed candle dict when minute rolls over
                         completed = self._candle_builder.tick(ce_ltp, pe_ltp, ts)
                         if completed:
                             self._process_candle(completed)
-
                         if self.session_done:
                             break
                 except queue.Empty:
@@ -774,10 +712,9 @@ class LiveStrategy:
                 if self.session_done:
                     break
 
-                # Status once per minute
                 if now_hhmm != last_status_minute:
                     last_status_minute = now_hhmm
-                    self._print_status(now_hhmm)
+                    self._print_status()
 
                 time.sleep(0.1)
 
@@ -788,6 +725,14 @@ class LiveStrategy:
             import traceback; traceback.print_exc()
         finally:
             collector.stop()
+            # Terminate T10_CSV_Collector subprocess
+            if collector_proc and collector_proc.poll() is None:
+                collector_proc.terminate()
+                try:
+                    collector_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    collector_proc.kill()
+                print("🛑 T10_CSV_Collector stopped.")
             print_trade_summary(self.completed_trades)
 
 
@@ -808,6 +753,10 @@ if __name__ == "__main__":
         print(f"❌ Token error: {e}")
         raise SystemExit(1)
 
+    # Launch T10_CSV_Collector as background subprocess — runs independently,
+    # writes nifty_YYYY-MM-DD.csv for backtest use
+    collector_proc = launch_collector()
+
     collector = DataCollector(access_token)
     strategy  = LiveStrategy()
-    strategy.run(collector)
+    strategy.run(collector, collector_proc)
