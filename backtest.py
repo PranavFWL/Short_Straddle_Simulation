@@ -369,8 +369,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                               f"PE {strike_to_use} @ {active['pe_entry']:.2f}  "
                               f"SL {active['pe_sl']:.2f}")
 
-                    # Skip SL/Target check on entry candle
-                    continue
+                    # Fall through — check SL/Target on entry candle immediately
 
                 # ── Fetch current candles for active trade ─────────────────────
                 ce_c = get_candle(candle_dt, active['ce_strike'], 'CALL')
