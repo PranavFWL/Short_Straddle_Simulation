@@ -1,8 +1,8 @@
 {
-  "date": "2026-03-11",
-  "atm_strike": 24050.0,
+  "date": "2026-03-12",
+  "atm_strike": 23600.0,
   "expiry_date": "2026-03-17",
-  "atm_ce_key": "NSE_FO|57797",
-  "atm_pe_key": "NSE_FO|57798",
-  "spot_at_open": 24031.85
+  "atm_ce_key": "NSE_FO|57753",
+  "atm_pe_key": "NSE_FO|57756",
+  "spot_at_open": 23613.3
 }

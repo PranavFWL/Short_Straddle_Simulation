@@ -22,9 +22,27 @@ DB_FILE       = 'gdfl_data.duckdb'
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _leg_pnl(entry, exit_price):
-    """Net PnL points for one short leg after transaction costs."""
-    cost = (entry + exit_price) * COST_PERCENT
+def _leg_pnl_fixed(points: float):
+    """
+    Fixed PnL for SL or Target exit.
+    points = +TARGET_POINTS for target, -SL_POINTS for SL.
+    Cost is based on approximate entry+exit prices but since we use fixed
+    points we approximate cost as 2 * avg_price * COST_PERCENT.
+    Cost is still deducted on top of fixed points.
+    """
+    # Cost is still calculated on entry + exit notional
+    # We pass actual entry and exit for cost only
+    return points  # cost deducted separately in _close_trade
+
+
+def _leg_cost(entry, exit_price):
+    """Transaction cost for one leg."""
+    return (entry + exit_price) * COST_PERCENT
+
+
+def _leg_pnl_time(entry, exit_price):
+    """PnL for time exit — actual prices used."""
+    cost = _leg_cost(entry, exit_price)
     return (entry - exit_price) - cost
 
 
@@ -114,13 +132,6 @@ def _load_from_combined_csv(date_str, entry_sql_time):
         (df['datetime'].dt.time <= time(15, 15))
     ].sort_values('datetime').reset_index(drop=True)
 
-    if not df.empty:
-        all_minutes = sorted(df['datetime'].dt.strftime('%Y-%m-%d %H:%M').unique())
-        if len(all_minutes) > 2:
-            drop_minutes = {all_minutes[0], all_minutes[-1]}
-            df = df[~df['datetime'].dt.strftime('%Y-%m-%d %H:%M').isin(drop_minutes)]
-            df = df.reset_index(drop=True)
-
     if df.empty:
         return None, None
 
@@ -192,25 +203,15 @@ def _get_db_dates(con):
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN BACKTEST
 #
-# KEY DESIGN DECISIONS (aligned with live_strategy.py):
-#
-# 1. FIXED STRIKE per day:
-#    CSV path  — uses the single strike present in the CSV (from T10 collector)
-#    DB path   — locks to ATM of the FIRST candle of the day, never recalculates
-#    Both match live which locks ATM once at session start.
-#
-# 2. EXIT PRICES (no slippage):
-#    Target → ce_low, pe_low  (exact level crossed, same as live)
-#    SL     → ce_sl, pe_sl    (exact level, same as live)
-#    Time   → candle close    (live PnL, same as live)
-#
-# 3. CONFLICT RESOLUTION:
-#    Open-proximity heuristic — identical to live_strategy.py
-#
-# 4. RE-ENTRY:
-#    Immediate next candle after SL/Target exit.
-#    Since candles are 1-minute, this equals "next minute boundary" —
-#    same as live which gates re-entry to (exit_candle_minute + 1 min).
+# KEY DESIGN:
+# 1. SL hit   → fixed -SL_POINTS per leg (+ costs). Exit price = ce_sl/pe_sl
+#               for record keeping only.
+# 2. Target   → fixed +TARGET_POINTS per leg (+ costs). Exit price =
+#               ce_entry - TARGET_POINTS / pe_entry - TARGET_POINTS
+#               for record keeping only.
+# 3. Time exit → actual candle close price used for real PnL.
+# 4. Conflict  → open-proximity heuristic (unchanged).
+# 5. Re-entry  → next candle after SL/Target exit (next minute boundary).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
@@ -270,8 +271,8 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
         print(f"\nFound {len(date_sources)} trading day(s).")
         print(f"Parameters : Date   = {date_label}")
         print(f"           : Entry  = {entry_time_str}")
-        print(f"           : SL     = {sl_points} pts/leg")
-        print(f"           : Target = {target_points} pts combined")
+        print(f"           : SL     = {sl_points} pts/leg (fixed deduction)")
+        print(f"           : Target = {target_points} pts/leg (fixed addition)")
         print(f"           : Lot    = {LOT_SIZE}\n")
 
     daily_results    = []
@@ -301,18 +302,14 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
             opts_idx = opts_day.set_index(['dt', 'strike_price', 'option_type'])
 
             # ── Strike mode ────────────────────────────────────────────────────
-            # CSV: one fixed strike for whole day (from T10 collector)
-            # DB : lock to ATM of first candle — never recalculate mid-session.
-            #      This matches live which locks ATM once at session start.
             unique_strikes = opts_day['strike_price'].unique()
             if source == 'csv' and len(unique_strikes) == 1:
                 fixed_strike = float(unique_strikes[0])
                 if not quiet:
                     print(f"  🔒 Fixed strike from CSV: {fixed_strike}")
             else:
-                # DB path: will be set from the first candle's spot open
                 fixed_strike     = None
-                day_first_strike = None  # locked once, never changed
+                day_first_strike = None
 
             def get_candle(candle_dt, strike, opt_type):
                 try:
@@ -330,14 +327,11 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 candle_time    = candle_dt.time()
                 is_exit_candle = (candle_time == time(15, 15))
 
-                # ── Determine strike to use ────────────────────────────────────
-                # CSV: always fixed_strike
-                # DB : lock on first candle (matches live locking ATM at open)
+                # ── Determine strike ───────────────────────────────────────────
                 if source == 'csv':
                     strike_to_use = fixed_strike
                 else:
                     if day_first_strike is None:
-                        # Lock strike from first candle's spot — never changes
                         day_first_strike = _atm(spot_open)
                         if not quiet:
                             print(f"  🔒 Fixed strike from DB (first candle): "
@@ -371,11 +365,11 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                         print(f"  ➤ TRADE #{trade_counter} OPEN  "
                               f"[{date_str} {candle_dt.strftime('%H:%M')}] "
                               f"CE {strike_to_use} @ {active['ce_entry']:.2f}  "
-                              f"PE {strike_to_use} @ {active['pe_entry']:.2f}")
+                              f"SL {active['ce_sl']:.2f}  |  "
+                              f"PE {strike_to_use} @ {active['pe_entry']:.2f}  "
+                              f"SL {active['pe_sl']:.2f}")
 
                     # Skip SL/Target check on entry candle
-                    # (same behaviour as live: entry candle open → don't check
-                    #  SL/Target until the NEXT candle completes)
                     continue
 
                 # ── Fetch current candles for active trade ─────────────────────
@@ -395,9 +389,10 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
                 # ── Per-minute display ─────────────────────────────────────────
                 if not quiet:
-                    ce_pts         = _leg_pnl(active['ce_entry'], ce_close)
-                    pe_pts         = _leg_pnl(active['pe_entry'], pe_close)
-                    trade_live_val = (ce_pts + pe_pts) * LOT_SIZE
+                    # Display uses live unrealised PnL (actual close prices)
+                    ce_live_pts    = active['ce_entry'] - ce_close
+                    pe_live_pts    = active['pe_entry'] - pe_close
+                    trade_live_val = (ce_live_pts + pe_live_pts) * LOT_SIZE
                     closed_pnl     = sum(t['trade_pnl_val'] for t in day_trades)
                     print(
                         f"  [{date_str} {candle_dt.strftime('%H:%M')}]  "
@@ -405,29 +400,33 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                         f"Trade#{active['trade_num']}  "
                         f"CE({active['ce_strike']}): {ce_close:.2f} | "
                         f"PE({active['pe_strike']}): {pe_close:.2f} | "
-                        f"Trade PnL: ₹{trade_live_val:+.2f} | "
+                        f"Unrealised PnL: ₹{trade_live_val:+.2f} | "
                         f"Day PnL: ₹{closed_pnl + trade_live_val:+.2f}"
                     )
 
                 exit_reason = None
                 ce_exit_px  = None
                 pe_exit_px  = None
+                ce_pnl_pts  = None
+                pe_pnl_pts  = None
                 do_reenter  = False
 
+                # ── Time exit — actual prices ──────────────────────────────────
                 if is_exit_candle:
                     exit_reason = 'Time'
                     ce_exit_px  = ce_close
                     pe_exit_px  = pe_close
+                    ce_pnl_pts  = _leg_pnl_time(active['ce_entry'], ce_exit_px)
+                    pe_pnl_pts  = _leg_pnl_time(active['pe_entry'], pe_exit_px)
 
                 else:
-                    # ── Target and SL on completed candle ──────────────────────
-                    target_pts = (
-                        (active['ce_entry'] - ce_low) +
-                        (active['pe_entry'] - pe_low)
-                    )
-                    target_hit = target_pts >= target_points
+                    # ── SL and Target detection (candle high/low) ──────────────
                     sl_hit     = (ce_high >= active['ce_sl'] or
                                   pe_high >= active['pe_sl'])
+                    # Target: combined drop across both legs >= target_points
+                    target_pts = ((active['ce_entry'] - ce_low) +
+                                  (active['pe_entry'] - pe_low))
+                    target_hit = target_pts >= target_points
 
                     if target_hit and sl_hit:
                         # ── Conflict: open-proximity heuristic ─────────────────
@@ -444,12 +443,8 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
                         if dist_to_sl <= dist_to_target:
                             exit_reason = 'SL'
-                            ce_exit_px  = active['ce_sl']
-                            pe_exit_px  = active['pe_sl']
                         else:
                             exit_reason = 'Target'
-                            ce_exit_px  = ce_low
-                            pe_exit_px  = pe_low
 
                         if not quiet:
                             print(f"  ⚡ Conflict at {candle_dt.strftime('%H:%M')} — "
@@ -460,19 +455,34 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
                     elif target_hit:
                         exit_reason = 'Target'
-                        ce_exit_px  = ce_low
-                        pe_exit_px  = pe_low
                         do_reenter  = True
 
                     elif sl_hit:
                         exit_reason = 'SL'
-                        ce_exit_px  = active['ce_sl']
-                        pe_exit_px  = active['pe_sl']
                         do_reenter  = True
 
+                    # ── Fixed PnL for SL/Target ────────────────────────────────
+                    if exit_reason == 'Target':
+                        # Exit price = entry - TARGET_POINTS (for record only)
+                        ce_exit_px = active['ce_entry'] - target_points
+                        pe_exit_px = active['pe_entry'] - target_points
+                        # Fixed +target_points per leg minus cost
+                        ce_cost    = _leg_cost(active['ce_entry'], ce_exit_px)
+                        pe_cost    = _leg_cost(active['pe_entry'], pe_exit_px)
+                        ce_pnl_pts = target_points - ce_cost
+                        pe_pnl_pts = target_points - pe_cost
+
+                    elif exit_reason == 'SL':
+                        # Exit price = entry + SL_POINTS (for record only)
+                        ce_exit_px = active['ce_sl']
+                        pe_exit_px = active['pe_sl']
+                        # Fixed -sl_points per leg minus cost
+                        ce_cost    = _leg_cost(active['ce_entry'], ce_exit_px)
+                        pe_cost    = _leg_cost(active['pe_entry'], pe_exit_px)
+                        ce_pnl_pts = -sl_points - ce_cost
+                        pe_pnl_pts = -sl_points - pe_cost
+
                 if exit_reason:
-                    ce_pnl_pts = _leg_pnl(active['ce_entry'], ce_exit_px)
-                    pe_pnl_pts = _leg_pnl(active['pe_entry'], pe_exit_px)
                     ce_pnl_val = ce_pnl_pts * LOT_SIZE
                     pe_pnl_val = pe_pnl_pts * LOT_SIZE
                     trade_val  = ce_pnl_val + pe_pnl_val
@@ -507,8 +517,12 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                                "🔴" if exit_reason == 'SL' else "🏁")
                         print(f"  {icon} TRADE #{record['trade_num']} CLOSED | "
                               f"{exit_reason} | "
-                              f"CE exit {ce_exit_px:.2f}  PE exit {pe_exit_px:.2f} | "
-                              f"Trade PnL: ₹{trade_val:+.2f}")
+                              f"CE entry {active['ce_entry'] if active else record['ce_entry']:.2f} "
+                              f"exit {ce_exit_px:.2f}  "
+                              f"PE entry {record['pe_entry']:.2f} "
+                              f"exit {pe_exit_px:.2f} | "
+                              f"Trade PnL: ₹{trade_val:+.2f} "
+                              f"({'fixed ±pts' if exit_reason != 'Time' else 'actual prices'})")
 
                     if not do_reenter:
                         break   # time exit — done for this day
@@ -626,7 +640,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Short Straddle Backtest (SL + Target + Re-entry)',
+        description='Short Straddle Backtest (Fixed SL/Target Points)',
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('--time', type=str, default='09:16',
@@ -634,7 +648,7 @@ if __name__ == "__main__":
     parser.add_argument('--sl', type=int, default=SL_POINTS,
                         help=f'SL points per leg (default {SL_POINTS})')
     parser.add_argument('--target', type=int, default=TARGET_POINTS,
-                        help=f'Target combined pts (default {TARGET_POINTS})')
+                        help=f'Target points per leg (default {TARGET_POINTS})')
     parser.add_argument('--date', type=str, default=None,
                         help='Filter to single date YYYY-MM-DD (default: all dates)')
     args = parser.parse_args()

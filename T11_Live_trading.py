@@ -24,9 +24,9 @@ COST_PERCENT  = 0.0025
 
 TOKEN_FILE            = 'upstox_token.txt'
 CACHE_FILE            = 'option_chain_cache.pkl'
-COLLECTOR_FILE        = 'T10_CSV_Collector.py'  # launched as subprocess at startup
-SESSION_STATE         = 'session_state.json'    # written by T10 after ATM lock
-SESSION_STATE_TIMEOUT = 60                      # max seconds to wait for T10's ATM lock
+COLLECTOR_FILE        = 'T10_CSV_Collector.py'
+SESSION_STATE         = 'session_state.json'
+SESSION_STATE_TIMEOUT = 60
 MAX_RECONNECTS        = 10
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -47,15 +47,17 @@ def _parse_time(hhmm: str) -> dt_time:
     h, m = map(int, hhmm.split(':'))
     return dt_time(h, m)
 
-def _leg_pnl(entry, exit_price):
-    cost = (entry + exit_price) * COST_PERCENT
-    return (entry - exit_price) - cost
+def _leg_cost(entry, exit_price):
+    """Transaction cost for one leg."""
+    return (entry + exit_price) * COST_PERCENT
+
+def _leg_pnl_time(entry, exit_price):
+    """PnL for time exit only — actual prices used."""
+    return (entry - exit_price) - _leg_cost(entry, exit_price)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COLLECTOR LAUNCHER
-# Starts T10_CSV_Collector.py as a background subprocess.
-# Returns the Popen handle so it can be terminated on exit.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def launch_collector() -> subprocess.Popen:
@@ -63,7 +65,7 @@ def launch_collector() -> subprocess.Popen:
         print(f"⚠️  {COLLECTOR_FILE} not found — CSV collection will not run.")
         return None
     env = os.environ.copy()
-    env['PYTHONUTF8'] = '1'          # force UTF-8 on Windows (fixes emoji/arrow encode errors)
+    env['PYTHONUTF8'] = '1'
     proc = subprocess.Popen(
         [sys.executable, '-X', 'utf8', COLLECTOR_FILE],
         stdout=subprocess.PIPE,
@@ -73,151 +75,12 @@ def launch_collector() -> subprocess.Popen:
         encoding='utf-8',
         env=env,
     )
-    # Forward collector output to console in a daemon thread
     def _forward():
         for line in proc.stdout:
             print(f"[T10] {line}", end='')
     threading.Thread(target=_forward, daemon=True, name="CollectorLog").start()
     print(f"🟢 T10_CSV_Collector started (PID {proc.pid})")
     return proc
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LIVE CANDLE BUILDER
-#
-# KEY DESIGN — prev-close-as-open:
-#   When a minute rolls over, the new candle OPEN = previous candle CLOSE,
-#   not the first WebSocket tick of the new minute.
-#
-#   Why: The first tick of a new minute may arrive late or be stale.
-#   The previous candle's close is a confirmed last-traded price, matching
-#   what T10_CSV_Collector records as the candle open.
-#   This makes entry price and SL levels stable and consistent with backtest.
-# ─────────────────────────────────────────────────────────────────────────────
-
-class LiveCandleBuilder:
-    """
-    Accumulates (ce_ltp, pe_ltp) ticks into 1-minute OHLC candles.
-    Returns a completed candle dict when the minute rolls over.
-
-    Fields: minute_dt, ce_open/high/low/close, pe_open/high/low/close
-    """
-
-    def __init__(self):
-        self._lock   = threading.Lock()
-        self._minute = None
-        self._ce     = None
-        self._pe     = None
-
-    def tick(self, ce_ltp: float, pe_ltp: float, ts: datetime):
-        candle_min = ts.replace(second=0, microsecond=0, tzinfo=None)
-
-        with self._lock:
-            if self._minute is None:
-                self._open_candle(candle_min, ce_ltp, pe_ltp)
-                return None
-
-            if candle_min > self._minute:
-                ce_prev_close = self._ce['close']
-                pe_prev_close = self._pe['close']
-
-                sealed = {
-                    'minute_dt': self._minute,
-                    'ce_open'  : self._ce['open'],
-                    'ce_high'  : self._ce['high'],
-                    'ce_low'   : self._ce['low'],
-                    'ce_close' : ce_prev_close,
-                    'pe_open'  : self._pe['open'],
-                    'pe_high'  : self._pe['high'],
-                    'pe_low'   : self._pe['low'],
-                    'pe_close' : pe_prev_close,
-                }
-                # New candle opens at prev close — not at incoming ltp
-                self._open_candle(candle_min, ce_prev_close, pe_prev_close)
-                # Incoming tick updates high/low/close only
-                self._ce['high']  = max(self._ce['high'],  ce_ltp)
-                self._ce['low']   = min(self._ce['low'],   ce_ltp)
-                self._ce['close'] = ce_ltp
-                self._pe['high']  = max(self._pe['high'],  pe_ltp)
-                self._pe['low']   = min(self._pe['low'],   pe_ltp)
-                self._pe['close'] = pe_ltp
-                return sealed
-
-            self._ce['high']  = max(self._ce['high'],  ce_ltp)
-            self._ce['low']   = min(self._ce['low'],   ce_ltp)
-            self._ce['close'] = ce_ltp
-            self._pe['high']  = max(self._pe['high'],  pe_ltp)
-            self._pe['low']   = min(self._pe['low'],   pe_ltp)
-            self._pe['close'] = pe_ltp
-            return None
-
-    def _open_candle(self, candle_min, ce_open, pe_open):
-        self._minute = candle_min
-        self._ce = {'open': ce_open, 'high': ce_open, 'low': ce_open, 'close': ce_open}
-        self._pe = {'open': pe_open, 'high': pe_open, 'low': pe_open, 'close': pe_open}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OPTION CHAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-class UpstoxOptionChain:
-
-    def __init__(self, access_token):
-        self.access_token = access_token
-        self.base_url     = "https://api.upstox.com/v2"
-        self.headers = {
-            'Content-Type' : 'application/json',
-            'Accept'       : 'application/json',
-            'Authorization': f'Bearer {access_token}',
-        }
-
-    def get_option_chain(self, instrument_key="NSE_INDEX|Nifty 50", expiry_date=None):
-        if not expiry_date:
-            expiry_date = self._get_nearest_expiry(instrument_key)
-        resp = requests.get(
-            f"{self.base_url}/option/chain",
-            params={'instrument_key': instrument_key, 'expiry_date': expiry_date},
-            headers=self.headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get('status') == 'success':
-            return data.get('data', []), expiry_date
-        raise Exception(f"API Error: {data}")
-
-    def _get_nearest_expiry(self, instrument_key):
-        resp = requests.get(
-            f"{self.base_url}/option/contract",
-            params={'instrument_key': instrument_key},
-            headers=self.headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get('status') == 'success':
-            contracts = data.get('data', [])
-            if contracts:
-                return sorted(set(c['expiry'] for c in contracts))[0]
-        raise Exception("Could not determine nearest expiry")
-
-    def get_atm_strike(self, chain_data):
-        spot  = chain_data[0].get('underlying_spot_price', 0)
-        all_k = sorted(e['strike_price'] for e in chain_data)
-        atm   = min(all_k, key=lambda x: abs(x - spot))
-        return atm, spot
-
-    def get_atm_instrument_keys(self, chain_data, atm_strike):
-        keys = {}
-        for entry in chain_data:
-            if entry['strike_price'] != atm_strike:
-                continue
-            ce_key = entry.get('call_options', {}).get('instrument_key')
-            pe_key = entry.get('put_options',  {}).get('instrument_key')
-            if ce_key: keys['CALL'] = ce_key
-            if pe_key: keys['PUT']  = pe_key
-        if len(keys) < 2:
-            raise Exception(f"Could not find CE/PE keys for ATM {atm_strike}")
-        return keys
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,16 +198,11 @@ class DataCollector:
             import traceback; traceback.print_exc()
 
     def _collect(self):
-        # ── Wait for T10_CSV_Collector to lock the ATM strike ─────────────────
-        # T10 writes session_state.json within seconds of startup (immediately
-        # after its own REST call completes). We wait for that file rather than
-        # making an independent REST call — this guarantees both systems use the
-        # exact same strike, expiry, and instrument keys.
-        today_str  = get_ist_time().strftime('%Y-%m-%d')
-        atm_strike = None
+        today_str   = get_ist_time().strftime('%Y-%m-%d')
+        atm_strike  = None
         expiry_date = None
-        atm_keys   = None
-        spot_price = 0.0
+        atm_keys    = None
+        spot_price  = 0.0
 
         print(f"⏳ Waiting for T10 to lock ATM strike "
               f"(max {SESSION_STATE_TIMEOUT}s)…")
@@ -368,8 +226,8 @@ class DataCollector:
                         print(f"   Expiry     : {expiry_date}")
                         print(f"   Spot       : {spot_price:.2f}")
                         break
-                except Exception as e:
-                    pass   # file may be mid-write, retry next loop
+                except Exception:
+                    pass
             time.sleep(0.5)
 
         if atm_strike is None:
@@ -384,20 +242,9 @@ class DataCollector:
         print(f"\n🔒 ATM Strike : {atm_strike}  |  Spot: {spot_price:.2f}"
               f"  |  Expiry: {expiry_date}")
 
-        # Wait until the next full minute boundary before connecting.
-        # This ensures T10's WebSocket is fully up and its first candle has
-        # sealed before live strategy processes any candles — eliminating the
-        # 1-candle head-start that caused live to enter one minute early.
-        now         = get_ist_time()
-        next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-        wait_secs   = (next_minute - now).total_seconds()
-        print(f"⏳ Syncing to next minute boundary "
-              f"({next_minute.strftime('%H:%M:%S')} IST) — "
-              f"waiting {wait_secs:.1f}s…")
-        self._stop_event.wait(wait_secs)
-        if self._stop_event.is_set():
-            return
-        print(f"✅ Synced. Connecting WebSocket now.\n")
+        # Connect immediately — no minute-boundary sync needed.
+        # Live strategy now works on raw ticks, not candles.
+        print(f"✅ Connecting WebSocket now.\n")
 
         opt_stream = OptionStreamer(self.access_token, atm_strike,
                                     atm_keys, expiry_date)
@@ -447,21 +294,22 @@ def print_trade_summary(completed_trades):
         return
 
     headers = ["#", "Leg", "Strike", "Entry Time", "Exit Time",
-               "Entry ₹", "Exit ₹", "Leg PnL (₹)", "Trade PnL (₹)"]
+               "Entry ₹", "Exit ₹", "Leg PnL (₹)", "Trade PnL (₹)", "Reason"]
     rows = []
     for i, t in enumerate(completed_trades, start=1):
         rows.append([i, "CE", t['ce_strike'],
                      t['ce_entry_time'], t['ce_exit_time'],
                      f"{t['ce_entry']:.2f}", f"{t['ce_exit']:.2f}",
-                     f"{t['ce_pnl_val']:+.2f}", f"{t['trade_pnl_val']:+.2f}"])
+                     f"{t['ce_pnl_val']:+.2f}", f"{t['trade_pnl_val']:+.2f}",
+                     t['exit_reason']])
         rows.append(["", "PE", t['pe_strike'],
                      t['pe_entry_time'], t['pe_exit_time'],
                      f"{t['pe_entry']:.2f}", f"{t['pe_exit']:.2f}",
-                     f"{t['pe_pnl_val']:+.2f}", ""])
+                     f"{t['pe_pnl_val']:+.2f}", "", ""])
 
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 110)
     print(f"  SESSION TRADE SUMMARY  ({len(completed_trades)} completed trades)")
-    print("=" * 100)
+    print("=" * 110)
     for line in tabulate(rows, headers=headers, tablefmt="rounded_outline",
                          stralign="center", numalign="center").split("\n"):
         print(line)
@@ -479,23 +327,20 @@ def print_trade_summary(completed_trades):
     print(f"  Best Trade    : ₹{best['trade_pnl_val']:+.2f}  (entered {best['ce_entry_time']})")
     print(f"  Worst Trade   : ₹{worst['trade_pnl_val']:+.2f}  (entered {worst['ce_entry_time']})")
     print(f"  Total Net PnL : ₹{pnl:+,.2f}")
-    print("=" * 100 + "\n")
+    print("=" * 110 + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LIVE STRATEGY
 #
-# Receives ticks from DataCollector, builds 1-min candles via LiveCandleBuilder,
-# and applies strategy logic once per completed candle — identical to backtest.
+# Tick-based SL/Target monitoring (no candle building for trade logic).
 #
-#   Entry  : candle open (prev-close-as-open) of first eligible minute
-#   Target : (ce_entry - ce_low) + (pe_entry - pe_low) >= TARGET_POINTS
-#            → exit at ce_low / pe_low  (exact, no slippage)
-#   SL     : ce_high >= ce_sl OR pe_high >= pe_sl
-#            → exit at ce_sl / pe_sl   (exact, no slippage)
-#   Conflict: open-proximity heuristic (identical to backtest)
-#   Re-entry: start of next minute after SL/Target exit
-#   Time   : EXIT_TIME candle close
+# Entry  : First tick at or after ENTRY_TIME (or re-entry minute boundary)
+# SL     : ce_ltp >= ce_sl OR pe_ltp >= pe_sl  → close, fixed -SL_POINTS/leg
+# Target : (ce_entry - ce_ltp) + (pe_entry - pe_ltp) >= TARGET_POINTS
+#          → close, fixed +TARGET_POINTS/leg
+# Re-entry: First tick of next minute boundary after SL/Target exit
+# Time   : EXIT_TIME → close at actual LTP, real PnL
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LiveStrategy:
@@ -513,149 +358,160 @@ class LiveStrategy:
         self._latest_pe       = 0.0
         self._spot_at_open    = 0.0
         self._atm_strike      = None
+
+        # Re-entry gate: datetime of next minute boundary after exit
         self._reentry_after   = None
-        self._candle_builder  = LiveCandleBuilder()
 
     def on_tick(self, ce_ltp: float, pe_ltp: float, ts: datetime):
         self._tick_queue.put((ce_ltp, pe_ltp, ts))
 
-    def _open_trade(self, ce_open: float, pe_open: float, minute_dt: datetime):
+    def _open_trade(self, ce_ltp: float, pe_ltp: float, ts: datetime):
         self.trade_counter += 1
-        hhmm   = minute_dt.strftime('%H:%M')
+        hhmm   = ts.strftime('%H:%M')
         strike = self._atm_strike
         self.active = {
             'trade_num'     : self.trade_counter,
-            'ce_strike'     : strike,  'pe_strike'     : strike,
-            'ce_entry'      : ce_open, 'pe_entry'      : pe_open,
-            'ce_sl'         : ce_open + SL_POINTS,
-            'pe_sl'         : pe_open + SL_POINTS,
-            'ce_entry_time' : hhmm,    'pe_entry_time' : hhmm,
+            'ce_strike'     : strike,
+            'pe_strike'     : strike,
+            'ce_entry'      : ce_ltp,
+            'pe_entry'      : pe_ltp,
+            'ce_sl'         : ce_ltp + SL_POINTS,
+            'pe_sl'         : pe_ltp + SL_POINTS,
+            'ce_entry_time' : hhmm,
+            'pe_entry_time' : hhmm,
         }
-        print(f"\n  ➤ TRADE #{self.trade_counter} OPEN  [{hhmm}]  Strike {strike}  |  "
-              f"CE @ {ce_open:.2f}  SL {ce_open + SL_POINTS:.2f}  |  "
-              f"PE @ {pe_open:.2f}  SL {pe_open + SL_POINTS:.2f}")
+        print(f"\n  ➤ TRADE #{self.trade_counter} OPEN  [{ts.strftime('%H:%M:%S')}]  "
+              f"Strike {strike}  |  "
+              f"CE @ {ce_ltp:.2f}  SL {ce_ltp + SL_POINTS:.2f}  |  "
+              f"PE @ {pe_ltp:.2f}  SL {pe_ltp + SL_POINTS:.2f}")
 
-    def _close_trade(self, ce_exit: float, pe_exit: float,
-                     reason: str, minute_dt: datetime):
+    def _close_trade(self, ce_ltp: float, pe_ltp: float,
+                     reason: str, ts: datetime):
+        """
+        Close active trade.
+        SL/Target → fixed ±points per leg.
+        Time      → actual LTP prices.
+        Returns True if re-entry should be scheduled (SL or Target).
+        """
         t    = self.active
         self.active = None
-        hhmm = minute_dt.strftime('%H:%M')
+        hhmm = ts.strftime('%H:%M')
 
-        ce_pnl_pts = _leg_pnl(t['ce_entry'], ce_exit)
-        pe_pnl_pts = _leg_pnl(t['pe_entry'], pe_exit)
+        if reason == 'Target':
+            # Fixed exit prices for record keeping
+            ce_exit    = t['ce_entry'] - TARGET_POINTS
+            pe_exit    = t['pe_entry'] - TARGET_POINTS
+            ce_cost    = _leg_cost(t['ce_entry'], ce_exit)
+            pe_cost    = _leg_cost(t['pe_entry'], pe_exit)
+            ce_pnl_pts = TARGET_POINTS - ce_cost
+            pe_pnl_pts = TARGET_POINTS - pe_cost
+
+        elif reason == 'SL':
+            # Fixed exit prices for record keeping
+            ce_exit    = t['ce_sl']
+            pe_exit    = t['pe_sl']
+            ce_cost    = _leg_cost(t['ce_entry'], ce_exit)
+            pe_cost    = _leg_cost(t['pe_entry'], pe_exit)
+            ce_pnl_pts = -SL_POINTS - ce_cost
+            pe_pnl_pts = -SL_POINTS - pe_cost
+
+        else:  # Time exit — actual LTP
+            ce_exit    = ce_ltp
+            pe_exit    = pe_ltp
+            ce_pnl_pts = _leg_pnl_time(t['ce_entry'], ce_exit)
+            pe_pnl_pts = _leg_pnl_time(t['pe_entry'], pe_exit)
+
         ce_pnl_val = ce_pnl_pts * LOT_SIZE
         pe_pnl_val = pe_pnl_pts * LOT_SIZE
         trade_val  = ce_pnl_val + pe_pnl_val
 
         record = {
             'trade_num'     : t['trade_num'],
-            'ce_strike'     : t['ce_strike'],    'pe_strike'     : t['pe_strike'],
-            'ce_entry_time' : t['ce_entry_time'],'ce_exit_time'  : hhmm,
-            'ce_entry'      : t['ce_entry'],     'ce_exit'       : ce_exit,
-            'ce_pnl_pts'    : ce_pnl_pts,        'ce_pnl_val'    : ce_pnl_val,
-            'pe_entry_time' : t['pe_entry_time'],'pe_exit_time'  : hhmm,
-            'pe_entry'      : t['pe_entry'],     'pe_exit'       : pe_exit,
-            'pe_pnl_pts'    : pe_pnl_pts,        'pe_pnl_val'    : pe_pnl_val,
+            'ce_strike'     : t['ce_strike'],
+            'pe_strike'     : t['pe_strike'],
+            'ce_entry_time' : t['ce_entry_time'],
+            'ce_exit_time'  : hhmm,
+            'ce_entry'      : t['ce_entry'],
+            'ce_exit'       : ce_exit,
+            'ce_pnl_pts'    : ce_pnl_pts,
+            'ce_pnl_val'    : ce_pnl_val,
+            'pe_entry_time' : t['pe_entry_time'],
+            'pe_exit_time'  : hhmm,
+            'pe_entry'      : t['pe_entry'],
+            'pe_exit'       : pe_exit,
+            'pe_pnl_pts'    : pe_pnl_pts,
+            'pe_pnl_val'    : pe_pnl_val,
             'trade_pnl_pts' : ce_pnl_pts + pe_pnl_pts,
             'trade_pnl_val' : trade_val,
             'exit_reason'   : reason,
         }
         self.completed_trades.append(record)
+
         icon = "🎯" if reason == 'Target' else ("🔴" if reason == 'SL' else "🏁")
-        print(f"\n  {icon} TRADE #{t['trade_num']} CLOSED  [{hhmm}]  {reason}  |  "
+        note = "fixed pts" if reason in ('SL', 'Target') else "actual LTP"
+        print(f"\n  {icon} TRADE #{t['trade_num']} CLOSED  "
+              f"[{ts.strftime('%H:%M:%S')}]  {reason}  |  "
               f"CE exit {ce_exit:.2f}  PE exit {pe_exit:.2f}  |  "
-              f"Trade PnL: ₹{trade_val:+.2f}")
+              f"Trade PnL: ₹{trade_val:+.2f}  ({note})")
+
         return reason in ('SL', 'Target')
 
-    def _process_candle(self, candle: dict):
-        minute_dt = candle['minute_dt']
-        hhmm      = minute_dt.strftime('%H:%M')
-        tick_time = dt_time(minute_dt.hour, minute_dt.minute)
+    def _process_tick(self, ce_ltp: float, pe_ltp: float, ts: datetime):
+        tick_time = dt_time(ts.hour, ts.minute)
         in_window = self.entry_time <= tick_time < self.exit_time
         is_exit   = tick_time >= self.exit_time
 
         if not in_window and not is_exit:
             return
 
-        ce_open  = candle['ce_open']
-        ce_high  = candle['ce_high']
-        ce_low   = candle['ce_low']
-        ce_close = candle['ce_close']
-        pe_open  = candle['pe_open']
-        pe_high  = candle['pe_high']
-        pe_low   = candle['pe_low']
-        pe_close = candle['pe_close']
-
-        # ── Entry ──────────────────────────────────────────────────────────────
-        if self.active is None and in_window:
-            if self._reentry_after and minute_dt < self._reentry_after:
-                return
-            self._open_trade(ce_open, pe_open, minute_dt)
-            return   # skip SL/Target on entry candle — same as backtest
-
-        if self.active is None:
+        # ── Time exit ─────────────────────────────────────────────────────────
+        if is_exit and self.active is not None:
+            self._close_trade(ce_ltp, pe_ltp, 'Time', ts)
+            self.session_done = True
             return
 
-        t           = self.active
-        exit_reason = None
-        ce_exit_px  = None
-        pe_exit_px  = None
-        do_reenter  = False
+        if not in_window:
+            return
 
-        # ── Time exit ──────────────────────────────────────────────────────────
-        if is_exit:
-            exit_reason = 'Time'
-            ce_exit_px  = ce_close
-            pe_exit_px  = pe_close
+        # ── Entry / Re-entry ──────────────────────────────────────────────────
+        if self.active is None:
+            # Re-entry gate: wait for next minute boundary
+            if self._reentry_after is not None:
+                # Strip tzinfo for naive comparison
+                ts_naive = ts.replace(tzinfo=None)
+                if ts_naive < self._reentry_after:
+                    return
+            self._open_trade(ce_ltp, pe_ltp, ts)
+            return  # don't check SL/Target on entry tick
 
+        # ── SL check (tick-level) ─────────────────────────────────────────────
+        t      = self.active
+        sl_hit = (ce_ltp >= t['ce_sl'] or pe_ltp >= t['pe_sl'])
+
+        # ── Target check (tick-level) ─────────────────────────────────────────
+        combined_drop = (t['ce_entry'] - ce_ltp) + (t['pe_entry'] - pe_ltp)
+        target_hit    = combined_drop >= TARGET_POINTS
+
+        if sl_hit and target_hit:
+            # Conflict on same tick — SL takes priority (conservative)
+            reason = 'SL'
+            print(f"  ⚡ Tick conflict [{ts.strftime('%H:%M:%S')}] "
+                  f"SL and Target both hit → SL wins (conservative)")
+        elif sl_hit:
+            reason = 'SL'
+        elif target_hit:
+            reason = 'Target'
         else:
-            target_pts = (t['ce_entry'] - ce_low) + (t['pe_entry'] - pe_low)
-            target_hit = target_pts >= TARGET_POINTS
-            sl_hit     = (ce_high >= t['ce_sl'] or pe_high >= t['pe_sl'])
+            return  # neither hit
 
-            if target_hit and sl_hit:
-                # Open-proximity conflict heuristic — identical to backtest
-                sl_dists = []
-                if ce_high >= t['ce_sl']:
-                    sl_dists.append(t['ce_sl'] - ce_open)
-                if pe_high >= t['pe_sl']:
-                    sl_dists.append(t['pe_sl'] - pe_open)
-                dist_to_sl     = min(sl_dists)
-                gain_at_open   = (t['ce_entry'] - ce_open) + (t['pe_entry'] - pe_open)
-                dist_to_target = max(0.0, TARGET_POINTS - gain_at_open)
-
-                if dist_to_sl <= dist_to_target:
-                    exit_reason = 'SL'
-                    ce_exit_px  = t['ce_sl']
-                    pe_exit_px  = t['pe_sl']
-                else:
-                    exit_reason = 'Target'
-                    ce_exit_px  = ce_low
-                    pe_exit_px  = pe_low
-
-                print(f"  ⚡ Conflict [{hhmm}] dist_to_sl={dist_to_sl:.2f}  "
-                      f"dist_to_target={dist_to_target:.2f}  → {exit_reason} wins")
-                do_reenter = True
-
-            elif target_hit:
-                exit_reason = 'Target'
-                ce_exit_px  = ce_low
-                pe_exit_px  = pe_low
-                do_reenter  = True
-
-            elif sl_hit:
-                exit_reason = 'SL'
-                ce_exit_px  = t['ce_sl']
-                pe_exit_px  = t['pe_sl']
-                do_reenter  = True
-
-        if exit_reason:
-            needs_reentry = self._close_trade(ce_exit_px, pe_exit_px,
-                                              exit_reason, minute_dt)
-            if needs_reentry:
-                self._reentry_after = minute_dt + timedelta(minutes=1)
-            if not do_reenter:
-                self.session_done = True
+        needs_reentry = self._close_trade(ce_ltp, pe_ltp, reason, ts)
+        if needs_reentry:
+            # Re-entry allowed from start of next minute boundary
+            ts_naive = ts.replace(tzinfo=None)
+            next_minute = (ts_naive + timedelta(minutes=1)).replace(
+                second=0, microsecond=0)
+            self._reentry_after = next_minute
+            print(f"  ⏳ Re-entry allowed from {next_minute.strftime('%H:%M:%S')}")
 
     def _print_status(self):
         now        = get_ist_time().strftime('%H:%M:%S')
@@ -664,14 +520,17 @@ class LiveStrategy:
         pe_ltp     = self._latest_pe
 
         if self.active:
-            t         = self.active
-            open_pnl  = (_leg_pnl(t['ce_entry'], ce_ltp or t['ce_entry']) +
-                         _leg_pnl(t['pe_entry'], pe_ltp or t['pe_entry'])) * LOT_SIZE
-            total_pnl = closed_pnl + open_pnl
-            pos_str   = (f"Trade#{t['trade_num']} ACTIVE  "
-                         f"CE {t['ce_strike']} LTP {ce_ltp:.2f}  "
-                         f"PE {t['pe_strike']} LTP {pe_ltp:.2f}  "
-                         f"Open PnL ₹{open_pnl:+.2f}")
+            t             = self.active
+            combined_drop = (t['ce_entry'] - ce_ltp) + (t['pe_entry'] - pe_ltp)
+            # Unrealised display uses actual LTP difference
+            open_pnl      = combined_drop * LOT_SIZE
+            total_pnl     = closed_pnl + open_pnl
+            pos_str       = (f"Trade#{t['trade_num']} ACTIVE  "
+                             f"CE {t['ce_strike']} LTP {ce_ltp:.2f} "
+                             f"SL {t['ce_sl']:.2f}  |  "
+                             f"PE {t['pe_strike']} LTP {pe_ltp:.2f} "
+                             f"SL {t['pe_sl']:.2f}  |  "
+                             f"Unrealised ₹{open_pnl:+.2f}")
         else:
             total_pnl = closed_pnl
             pos_str   = "No active position"
@@ -682,9 +541,10 @@ class LiveStrategy:
 
     def run(self, collector: DataCollector, collector_proc: subprocess.Popen):
         print("\n" + "=" * 65)
-        print("  🚀  LIVE SHORT STRADDLE  (candle-aligned, backtest-matched)")
+        print("  🚀  LIVE SHORT STRADDLE  (tick-based SL/Target)")
         print(f"  Entry  : {ENTRY_TIME}    Exit   : {EXIT_TIME}")
-        print(f"  SL     : {SL_POINTS} pts/leg    Target : {TARGET_POINTS} pts combined")
+        print(f"  SL     : {SL_POINTS} pts/leg (fixed)    "
+              f"Target : {TARGET_POINTS} pts combined (fixed)")
         print(f"  Lot    : {LOT_SIZE}")
         print("=" * 65)
 
@@ -697,7 +557,8 @@ class LiveStrategy:
 
         self._atm_strike   = collector.atm_strike
         self._spot_at_open = collector.spot_at_open
-        print(f"✅ Stream active. ATM Strike: {self._atm_strike}. Strategy running.\n")
+        print(f"✅ Stream active. ATM Strike: {self._atm_strike}. "
+              f"Strategy running.\n")
 
         last_status_minute = None
 
@@ -710,15 +571,13 @@ class LiveStrategy:
                     print("\n🏁 Session complete.")
                     break
 
-                # Drain tick queue → feed into candle builder
+                # Drain tick queue → process each tick directly
                 try:
                     while True:
                         ce_ltp, pe_ltp, ts = self._tick_queue.get_nowait()
                         self._latest_ce = ce_ltp
                         self._latest_pe = pe_ltp
-                        completed = self._candle_builder.tick(ce_ltp, pe_ltp, ts)
-                        if completed:
-                            self._process_candle(completed)
+                        self._process_tick(ce_ltp, pe_ltp, ts)
                         if self.session_done:
                             break
                 except queue.Empty:
@@ -727,11 +586,12 @@ class LiveStrategy:
                 if self.session_done:
                     break
 
+                # Print status once per minute
                 if now_hhmm != last_status_minute:
                     last_status_minute = now_hhmm
                     self._print_status()
 
-                time.sleep(0.1)
+                time.sleep(0.05)  # tighter loop for tick responsiveness
 
         except KeyboardInterrupt:
             print("\n\n👋 Strategy stopped.")
@@ -740,7 +600,6 @@ class LiveStrategy:
             import traceback; traceback.print_exc()
         finally:
             collector.stop()
-            # Terminate T10_CSV_Collector subprocess
             if collector_proc and collector_proc.poll() is None:
                 collector_proc.terminate()
                 try:
@@ -768,10 +627,11 @@ if __name__ == "__main__":
         print(f"❌ Token error: {e}")
         raise SystemExit(1)
 
-    # Launch T10_CSV_Collector as background subprocess — runs independently,
-    # writes nifty_YYYY-MM-DD.csv for backtest use
-    collector_proc = launch_collector()
+    if os.path.exists(SESSION_STATE):
+        os.remove(SESSION_STATE)
+        print(f"🗑️  Cleared stale {SESSION_STATE} — waiting for fresh write from T10.")
 
-    collector = DataCollector(access_token)
-    strategy  = LiveStrategy()
+    collector_proc = launch_collector()
+    collector      = DataCollector(access_token)
+    strategy       = LiveStrategy()
     strategy.run(collector, collector_proc)
