@@ -9,8 +9,8 @@ import os
 import glob
 
 
-SL_POINTS     = 10
-TARGET_POINTS = 10
+SL_POINTS     = 20
+TARGET_POINTS = 5
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
@@ -146,7 +146,7 @@ def _load_from_combined_csv(date_str, entry_sql_time):
     entry_time_obj = datetime.strptime(entry_sql_time, '%H:%M:%S').time()
     df = df[
         (df['datetime'].dt.time >= entry_time_obj) &
-        (df['datetime'].dt.time <= time(15, 30))
+        (df['datetime'].dt.time <= time(15, 15))
     ].sort_values('datetime').reset_index(drop=True)
 
     if df.empty:
@@ -176,7 +176,7 @@ def _load_from_db(con, date_str, entry_sql_time):
         SELECT datetime, open FROM spot_data
         WHERE date = '{date_str}'
         AND cast(datetime as time) >= '{entry_sql_time}'
-        AND cast(datetime as time) <= '15:30:00'
+        AND cast(datetime as time) <= '15:15:00'
         ORDER BY datetime
     """).fetchdf()
 
@@ -185,7 +185,7 @@ def _load_from_db(con, date_str, entry_sql_time):
         FROM options_data
         WHERE date = '{date_str}' AND expiry_date = '{expiry}'
         AND cast(datetime as time) >= '{entry_sql_time}'
-        AND cast(datetime as time) <= '15:30:00'
+        AND cast(datetime as time) <= '15:15:00'
         ORDER BY datetime
     """).fetchdf()
 
@@ -236,7 +236,7 @@ def _get_db_dates(con):
 #           the same candle's HIGH hits SL and LOW gives a target.
 #           Fixed +TARGET_POINTS per leg added (+ costs).
 #
-#   Time : 15:30 candle close — actual prices used.
+#   Time : 15:15 candle close — actual prices used.
 #
 #   Re-entry: next candle after SL or Target exit.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,7 +355,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 candle_dt      = pd.to_datetime(spot_row['datetime'])
                 spot_open      = float(spot_row['open'])
                 candle_time    = candle_dt.time()
-                is_exit_candle = (candle_time == time(15, 30))
+                is_exit_candle = (candle_time == time(15, 15))
 
                 # ── Determine strike ───────────────────────────────────────────
                 if source == 'csv':
