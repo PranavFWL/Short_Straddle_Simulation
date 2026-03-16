@@ -17,10 +17,25 @@ from tabulate import tabulate
 
 ENTRY_TIME    = "09:16"
 EXIT_TIME     = "15:30"
-SL_POINTS     = 10
-TARGET_POINTS = 10
+SL_POINTS     = 20
+TARGET_POINTS = 5
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
+
+# ── Timeframe ─────────────────────────────────────────────────────────────────
+# Controls the bar-alignment grid for ALL entries (initial + re-entry).
+# Must match TF_SECONDS in T10_CSV_Collector.py.
+#
+# Examples (ENTRY_TIME = "09:16"):
+#   TF_SECONDS = 30  → entries at 09:16:00, 09:16:30, 09:17:00, …
+#   TF_SECONDS = 60  → entries at 09:16:00, 09:17:00, 09:18:00, …
+#   TF_SECONDS = 180 → entries at 09:16:00, 09:19:00, 09:22:00, …
+#   TF_SECONDS = 300 → entries at 09:16:00, 09:21:00, 09:26:00, …
+#
+# ENTRY_TIME is always the first valid bar open. Subsequent bars are
+# ENTRY_TIME + N*TF_SECONDS seconds (N = 1, 2, 3, …).
+# ─────────────────────────────────────────────────────────────────────────────
+TF_SECONDS = 60
 
 TOKEN_FILE            = 'upstox_token.txt'
 CACHE_FILE            = 'option_chain_cache.pkl'
@@ -54,6 +69,34 @@ def _leg_cost(entry, exit_price):
 def _leg_pnl_time(entry, exit_price):
     """PnL for time exit only — actual prices used."""
     return (entry - exit_price) - _leg_cost(entry, exit_price)
+
+# ── Bar-alignment helpers ─────────────────────────────────────────────────────
+
+# Pre-compute ENTRY_TIME as a dt_time object once.
+_ENTRY_DT = _parse_time(ENTRY_TIME)
+
+def _bar_open_for(ts: datetime) -> datetime:
+    """
+    Return the bar-open datetime that *ts* falls inside, aligned to the
+    TF_SECONDS grid anchored at ENTRY_TIME on the same calendar date.
+    Result is naive (no tzinfo).
+    """
+    ts_naive = ts.replace(tzinfo=None)
+    anchor   = ts_naive.replace(
+        hour=_ENTRY_DT.hour, minute=_ENTRY_DT.minute,
+        second=0, microsecond=0)
+
+    if ts_naive < anchor:
+        return anchor
+
+    elapsed = int((ts_naive - anchor).total_seconds())
+    offset  = (elapsed // TF_SECONDS) * TF_SECONDS
+    return anchor + timedelta(seconds=offset)
+
+
+def _next_bar_open(ts: datetime) -> datetime:
+    """Return the next bar-open after *ts* on the TF_SECONDS grid. Naive."""
+    return _bar_open_for(ts) + timedelta(seconds=TF_SECONDS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,9 +284,6 @@ class DataCollector:
 
         print(f"\n🔒 ATM Strike : {atm_strike}  |  Spot: {spot_price:.2f}"
               f"  |  Expiry: {expiry_date}")
-
-        # Connect immediately — no minute-boundary sync needed.
-        # Live strategy now works on raw ticks, not candles.
         print(f"✅ Connecting WebSocket now.\n")
 
         opt_stream = OptionStreamer(self.access_token, atm_strike,
@@ -333,14 +373,16 @@ def print_trade_summary(completed_trades):
 # ─────────────────────────────────────────────────────────────────────────────
 # LIVE STRATEGY
 #
-# Tick-based SL/Target monitoring (no candle building for trade logic).
+# Tick-based SL/Target monitoring with TF_SECONDS bar-alignment for entries.
 #
-# Entry  : First tick at or after ENTRY_TIME (or re-entry minute boundary)
-# SL     : ce_ltp >= ce_sl OR pe_ltp >= pe_sl  → close, fixed -SL_POINTS/leg
-# Target : (ce_entry - ce_ltp) + (pe_entry - pe_ltp) >= TARGET_POINTS
-#          → close, fixed +TARGET_POINTS/leg
-# Re-entry: First tick of next minute boundary after SL/Target exit
-# Time   : EXIT_TIME → close at actual LTP, real PnL
+# Entry grid : ENTRY_TIME, ENTRY_TIME + TF_SECONDS seconds, ENTRY_TIME + 2*TF_SECONDS seconds…
+#
+# Initial entry  : First tick that falls inside the first bar (i.e. ts is
+#                  within the first TF_SECONDS-second window starting at ENTRY_TIME).
+# Re-entry gate  : After SL or Target exit, next entry is allowed only from
+#                  the start of the NEXT bar boundary (_next_bar_open).
+# SL / Target    : Tick-level, same as before — fixed ±points.
+# Time exit      : EXIT_TIME → actual LTP prices.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LiveStrategy:
@@ -359,7 +401,8 @@ class LiveStrategy:
         self._spot_at_open    = 0.0
         self._atm_strike      = None
 
-        # Re-entry gate: datetime of next minute boundary after exit
+        # Re-entry gate: naive datetime of the next valid bar open.
+        # None  → no restriction (first entry of the session).
         self._reentry_after   = None
 
     def on_tick(self, ce_ltp: float, pe_ltp: float, ts: datetime):
@@ -377,13 +420,15 @@ class LiveStrategy:
             'pe_entry'      : pe_ltp,
             'ce_sl'         : ce_ltp + SL_POINTS,
             'pe_sl'         : pe_ltp + SL_POINTS,
+            'ce_target'     : ce_ltp - TARGET_POINTS,
+            'pe_target'     : pe_ltp - TARGET_POINTS,
             'ce_entry_time' : hhmm,
             'pe_entry_time' : hhmm,
         }
         print(f"\n  ➤ TRADE #{self.trade_counter} OPEN  [{ts.strftime('%H:%M:%S')}]  "
               f"Strike {strike}  |  "
-              f"CE @ {ce_ltp:.2f}  SL {ce_ltp + SL_POINTS:.2f}  |  "
-              f"PE @ {pe_ltp:.2f}  SL {pe_ltp + SL_POINTS:.2f}")
+              f"CE @ {ce_ltp:.2f}  SL {ce_ltp+SL_POINTS:.2f}  Tgt {ce_ltp-TARGET_POINTS:.2f}  |  "
+              f"PE @ {pe_ltp:.2f}  SL {pe_ltp+SL_POINTS:.2f}  Tgt {pe_ltp-TARGET_POINTS:.2f}")
 
     def _close_trade(self, ce_ltp: float, pe_ltp: float,
                      reason: str, ts: datetime):
@@ -398,7 +443,6 @@ class LiveStrategy:
         hhmm = ts.strftime('%H:%M')
 
         if reason == 'Target':
-            # Fixed exit prices for record keeping
             ce_exit    = t['ce_entry'] - TARGET_POINTS
             pe_exit    = t['pe_entry'] - TARGET_POINTS
             ce_cost    = _leg_cost(t['ce_entry'], ce_exit)
@@ -407,7 +451,6 @@ class LiveStrategy:
             pe_pnl_pts = TARGET_POINTS - pe_cost
 
         elif reason == 'SL':
-            # Fixed exit prices for record keeping
             ce_exit    = t['ce_sl']
             pe_exit    = t['pe_sl']
             ce_cost    = _leg_cost(t['ce_entry'], ce_exit)
@@ -475,25 +518,45 @@ class LiveStrategy:
 
         # ── Entry / Re-entry ──────────────────────────────────────────────────
         if self.active is None:
-            # Re-entry gate: wait for next minute boundary
-            if self._reentry_after is not None:
-                # Strip tzinfo for naive comparison
-                ts_naive = ts.replace(tzinfo=None)
-                if ts_naive < self._reentry_after:
+            ts_naive = ts.replace(tzinfo=None)
+
+            if self._reentry_after is None:
+                # ── First entry of the session ────────────────────────────────
+                # Allow entry only if we are inside the first valid bar
+                # (i.e. bar_open_for(ts) == first bar open at ENTRY_TIME).
+                # This prevents entering mid-session if the script starts late.
+                first_bar = ts_naive.replace(
+                    hour=_ENTRY_DT.hour, minute=_ENTRY_DT.minute,
+                    second=0, microsecond=0)
+                current_bar = _bar_open_for(ts)
+                if current_bar != first_bar:
+                    # Landed in a bar that isn't bar 0 — wait for next bar
+                    next_bar = _next_bar_open(ts)
+                    self._reentry_after = next_bar
+                    print(f"  ⏳ Script started mid-bar. "
+                          f"First entry allowed from {next_bar.strftime('%H:%M:%S')}")
                     return
-            self._open_trade(ce_ltp, pe_ltp, ts)
-            return  # don't check SL/Target on entry tick
+                # We're in the first bar — enter immediately on this tick
+                self._open_trade(ce_ltp, pe_ltp, ts)
+
+            else:
+                # ── Subsequent entries (after SL / Target exit) ───────────────
+                # Gate: tick must be at or after _reentry_after
+                if ts_naive < self._reentry_after:
+                    return   # still inside the closed-out bar — skip
+                self._open_trade(ce_ltp, pe_ltp, ts)
+
+            return  # don't check SL/Target on the entry tick itself
 
         # ── SL check (tick-level) ─────────────────────────────────────────────
         t      = self.active
         sl_hit = (ce_ltp >= t['ce_sl'] or pe_ltp >= t['pe_sl'])
 
         # ── Target check (tick-level) ─────────────────────────────────────────
-        combined_drop = (t['ce_entry'] - ce_ltp) + (t['pe_entry'] - pe_ltp)
-        target_hit    = combined_drop >= TARGET_POINTS
+        # Per-leg: any leg dropping TARGET_POINTS below its entry triggers target
+        target_hit = (ce_ltp <= t['ce_target'] or pe_ltp <= t['pe_target'])
 
         if sl_hit and target_hit:
-            # Conflict on same tick — SL takes priority (conservative)
             reason = 'SL'
             print(f"  ⚡ Tick conflict [{ts.strftime('%H:%M:%S')}] "
                   f"SL and Target both hit → SL wins (conservative)")
@@ -502,16 +565,15 @@ class LiveStrategy:
         elif target_hit:
             reason = 'Target'
         else:
-            return  # neither hit
+            return
 
         needs_reentry = self._close_trade(ce_ltp, pe_ltp, reason, ts)
         if needs_reentry:
-            # Re-entry allowed from start of next minute boundary
-            ts_naive = ts.replace(tzinfo=None)
-            next_minute = (ts_naive + timedelta(minutes=1)).replace(
-                second=0, microsecond=0)
-            self._reentry_after = next_minute
-            print(f"  ⏳ Re-entry allowed from {next_minute.strftime('%H:%M:%S')}")
+            # Re-entry only from start of the NEXT bar on the TF grid
+            next_bar = _next_bar_open(ts)
+            self._reentry_after = next_bar
+            print(f"  ⏳ Re-entry allowed from {next_bar.strftime('%H:%M:%S')}  "
+                  f"(TF = {TF_SECONDS}s)")
 
     def _print_status(self):
         now        = get_ist_time().strftime('%H:%M:%S')
@@ -521,9 +583,9 @@ class LiveStrategy:
 
         if self.active:
             t             = self.active
-            combined_drop = (t['ce_entry'] - ce_ltp) + (t['pe_entry'] - pe_ltp)
-            # Unrealised display uses actual LTP difference
-            open_pnl      = combined_drop * LOT_SIZE
+            ce_live_pts   = t['ce_entry'] - ce_ltp
+            pe_live_pts   = t['pe_entry'] - pe_ltp
+            open_pnl      = (ce_live_pts + pe_live_pts) * LOT_SIZE
             total_pnl     = closed_pnl + open_pnl
             pos_str       = (f"Trade#{t['trade_num']} ACTIVE  "
                              f"CE {t['ce_strike']} LTP {ce_ltp:.2f} "
@@ -535,16 +597,23 @@ class LiveStrategy:
             total_pnl = closed_pnl
             pos_str   = "No active position"
 
-        print(f"  [{now}]  ATM {self._atm_strike}  |  "
+        reentry_str = ""
+        if self._reentry_after and self.active is None:
+            reentry_str = f"  |  Next entry ≥ {self._reentry_after.strftime('%H:%M:%S')}"
+
+        print(f"  [{now}]  ATM {self._atm_strike}  |  TF {TF_SECONDS}s  |  "
               f"Trades {len(self.completed_trades)}  |  "
-              f"Session PnL ₹{total_pnl:+.2f}  |  {pos_str}")
+              f"Session PnL ₹{total_pnl:+.2f}  |  {pos_str}{reentry_str}")
 
     def run(self, collector: DataCollector, collector_proc: subprocess.Popen):
         print("\n" + "=" * 65)
         print("  🚀  LIVE SHORT STRADDLE  (tick-based SL/Target)")
         print(f"  Entry  : {ENTRY_TIME}    Exit   : {EXIT_TIME}")
+        print(f"  TF     : {TF_SECONDS}s  "
+              f"(bars at {ENTRY_TIME}, "
+              f"+{TF_SECONDS}s, +{TF_SECONDS*2}s, …)")
         print(f"  SL     : {SL_POINTS} pts/leg (fixed)    "
-              f"Target : {TARGET_POINTS} pts combined (fixed)")
+              f"Target : {TARGET_POINTS} pts/leg (fixed)")
         print(f"  Lot    : {LOT_SIZE}")
         print("=" * 65)
 
@@ -571,7 +640,6 @@ class LiveStrategy:
                     print("\n🏁 Session complete.")
                     break
 
-                # Drain tick queue → process each tick directly
                 try:
                     while True:
                         ce_ltp, pe_ltp, ts = self._tick_queue.get_nowait()
@@ -586,12 +654,11 @@ class LiveStrategy:
                 if self.session_done:
                     break
 
-                # Print status once per minute
                 if now_hhmm != last_status_minute:
                     last_status_minute = now_hhmm
                     self._print_status()
 
-                time.sleep(0.05)  # tighter loop for tick responsiveness
+                time.sleep(0.05)
 
         except KeyboardInterrupt:
             print("\n\n👋 Strategy stopped.")

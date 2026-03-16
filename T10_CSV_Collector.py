@@ -5,12 +5,18 @@ Combines T8 (Nifty50 spot) + T9 (Option Chain) real-time streams into a
 single CSV file: nifty_YYYY-MM-DD.csv
 
 ATM strike is calculated ONCE at session start and fixed for the entire session.
-Only 2 rows are written per completed 1-minute candle: one CALL + one PUT for
+Only 2 rows are written per completed TF-minute candle: one CALL + one PUT for
 that fixed ATM strike.
 
 CSV Format (matches backtest.py exactly):
   datetime, date, spot_open, expiry_date, strike_price, option_type,
   open, high, low, close
+
+Timeframe:
+  Set TF_MINUTES below. The candle grid is anchored at 09:15 IST.
+    TF_MINUTES = 1  → candles at 09:15, 09:16, 09:17, … (original behaviour)
+    TF_MINUTES = 3  → candles at 09:15, 09:18, 09:21, …
+    TF_MINUTES = 5  → candles at 09:15, 09:20, 09:25, …
 
 Run:
     python T10_CSV_Collector.py
@@ -39,6 +45,22 @@ CACHE_FILE    = 'option_chain_cache.pkl'
 MAX_RECONNECTS = 10
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# ── Timeframe ─────────────────────────────────────────────────────────────────
+# Controls candle width. Must match TF_MINUTES in live_strategy.py.
+#
+#   TF_MINUTES = 1  → 1-min candles  (original behaviour)
+#   TF_MINUTES = 3  → 3-min candles  (bars: 09:15, 09:18, 09:21 …)
+#   TF_MINUTES = 5  → 5-min candles  (bars: 09:15, 09:20, 09:25 …)
+#
+# The bar grid is always anchored at 09:15 IST (market open).
+# ─────────────────────────────────────────────────────────────────────────────
+TF_MINUTES = 1
+
+# Anchor for the bar grid — must stay at market open (09:15)
+_CANDLE_ANCHOR_H = 9
+_CANDLE_ANCHOR_M = 15
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -72,56 +94,95 @@ def _to_float(v, default=0.0):
     except: return default
 
 
+def _candle_start(ts: datetime, tf: int) -> datetime:
+    """
+    Return the TF-minute bar-open datetime that *ts* belongs to,
+    anchored at 09:15 IST on the same calendar date.
+
+    The result has tzinfo stripped (naive) so it can be used as a
+    dict key without timezone ambiguity.
+
+    Examples (TF=3, anchor=09:15):
+        09:15:00 → 09:15   09:17:42 → 09:15   09:18:00 → 09:18
+        09:20:59 → 09:18   09:21:00 → 09:21
+    """
+    ts_naive = ts.replace(tzinfo=None)
+    anchor   = ts_naive.replace(
+        hour=_CANDLE_ANCHOR_H, minute=_CANDLE_ANCHOR_M,
+        second=0, microsecond=0)
+
+    if ts_naive < anchor:
+        return anchor                          # before market open — use first bar
+
+    elapsed_minutes = int((ts_naive - anchor).total_seconds() // 60)
+    bar_offset      = (elapsed_minutes // tf) * tf
+    return anchor + timedelta(minutes=bar_offset)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CANDLE BUILDER  (1-minute OHLC)
+# CANDLE BUILDER  (TF-minute OHLC)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CandleBuilder:
     """
-    Accumulates tick data and closes a 1-minute OHLC candle.
+    Accumulates tick data and closes a TF-minute OHLC candle.
     Only seals completed candles — no partial candle data is ever written.
+
+    The bar boundary is computed via _candle_start(), so changing TF_MINUTES
+    automatically widens or narrows every candle with no other code changes.
     """
 
-    def __init__(self):
+    def __init__(self, tf_minutes: int = TF_MINUTES):
+        self._tf         = tf_minutes
         self._lock       = threading.Lock()
-        self._candle_min = None
+        self._candle_bar = None   # naive datetime of current bar open
         self._open       = None
         self._high       = None
         self._low        = None
         self._close      = None
-        self.last_closed = None   # {minute_dt, open, high, low, close}
+        self.last_closed = None   # {bar_dt, open, high, low, close}
 
     def tick(self, ltp: float, ts: datetime) -> bool:
-        """Feed a tick. Returns True when a candle just sealed."""
+        """
+        Feed a tick. Returns True when a candle just sealed.
+
+        A candle seals when the first tick of a NEW bar arrives —
+        identical to the original 1-minute logic, but the boundary is now
+        every TF_MINUTES minutes anchored at 09:15.
+        """
         if ltp <= 0:
             return False
 
-        candle_min = ts.replace(second=0, microsecond=0)
+        bar_dt = _candle_start(ts, self._tf)   # naive bar-open datetime
         closed = False
 
         with self._lock:
-            if self._candle_min is None:
-                self._open_candle(candle_min, ltp)
-            elif candle_min > self._candle_min:
-                # Seal completed candle BEFORE resetting
+            if self._candle_bar is None:
+                # First ever tick
+                self._open_candle(bar_dt, ltp)
+
+            elif bar_dt > self._candle_bar:
+                # Tick belongs to a NEW bar — seal the completed bar first
                 self.last_closed = {
-                    'minute_dt': self._candle_min,
-                    'open'     : self._open,
+                    'minute_dt': self._candle_bar,   # kept as 'minute_dt' for
+                    'open'     : self._open,          # compatibility with callers
                     'high'     : self._high,
                     'low'      : self._low,
                     'close'    : self._close,
                 }
-                self._open_candle(candle_min, ltp)
+                self._open_candle(bar_dt, ltp)
                 closed = True
+
             else:
+                # Same bar — update OHLC
                 self._high  = max(self._high, ltp)
                 self._low   = min(self._low,  ltp)
                 self._close = ltp
 
         return closed
 
-    def _open_candle(self, candle_min, ltp):
-        self._candle_min = candle_min
+    def _open_candle(self, bar_dt, ltp):
+        self._candle_bar = bar_dt
         self._open  = ltp
         self._high  = ltp
         self._low   = ltp
@@ -141,22 +202,31 @@ class SharedState:
 
     def __init__(self):
         self._lock        = threading.Lock()
-        self.spot_opens   = {}   # {naive minute_dt: spot_open float}
+        self.spot_opens   = {}   # {naive bar_dt: spot_open float}
         self.pending_rows = []
 
-    def set_spot_open(self, minute_dt: datetime, spot_open: float):
-        key = minute_dt.replace(tzinfo=None)
+    def set_spot_open(self, bar_dt: datetime, spot_open: float):
+        """Record spot open price for the bar that just closed."""
+        key = bar_dt.replace(tzinfo=None)
         with self._lock:
             self.spot_opens[key] = spot_open
 
-    def get_spot_open(self, minute_dt: datetime):
-        key = minute_dt.replace(tzinfo=None)
+    def get_spot_open(self, bar_dt: datetime):
+        """
+        Look up the spot open for *bar_dt*.
+        Falls back to the most recent earlier bar if needed — handles the race
+        where an option candle seals fractionally before the spot candle on the
+        same boundary (extremely rare but possible).
+        """
+        key = bar_dt.replace(tzinfo=None)
         with self._lock:
-            # Try exact minute first, then previous minute as fallback
             if key in self.spot_opens:
                 return self.spot_opens[key]
-            prev = key - timedelta(minutes=1)
-            return self.spot_opens.get(prev)
+            # Scan backwards through all stored bars to find the nearest earlier one
+            earlier = [k for k in self.spot_opens if k < key]
+            if earlier:
+                return self.spot_opens[max(earlier)]
+            return None
 
     def add_rows(self, rows: list):
         with self._lock:
@@ -241,23 +311,15 @@ class UpstoxOptionChain:
         raise Exception("Could not determine nearest expiry")
 
     def get_atm_strike(self, chain_data):
-        """
-        Calculate ATM strike from spot price. Fixed once at session start.
-        Returns (atm_strike, spot_price, expiry_date).
-        """
         if not chain_data:
             raise Exception("Empty option chain data")
-        spot    = chain_data[0].get('underlying_spot_price', 0)
-        all_k   = sorted(e['strike_price'] for e in chain_data)
-        atm     = min(all_k, key=lambda x: abs(x - spot))
+        spot  = chain_data[0].get('underlying_spot_price', 0)
+        all_k = sorted(e['strike_price'] for e in chain_data)
+        atm   = min(all_k, key=lambda x: abs(x - spot))
         print(f"📊 Spot: {spot:.2f}  ATM Strike (fixed): {atm}")
         return atm, spot
 
     def get_atm_instrument_keys(self, chain_data, atm_strike):
-        """
-        Return instrument keys for only the ATM strike (CALL + PUT).
-        Returns {('CALL'|'PUT'): instrument_key}
-        """
         keys = {}
         for entry in chain_data:
             if entry['strike_price'] != atm_strike:
@@ -269,7 +331,8 @@ class UpstoxOptionChain:
             if pe_key:
                 keys['PUT'] = pe_key
         if len(keys) < 2:
-            raise Exception(f"Could not find both CE and PE keys for ATM {atm_strike}")
+            raise Exception(
+                f"Could not find both CE and PE keys for ATM {atm_strike}")
         print(f"🔑 ATM instrument keys: CALL={keys['CALL']}  PUT={keys['PUT']}")
         return keys
 
@@ -287,6 +350,7 @@ class SpotStreamer:
         self.shared       = shared
         self.streamer     = None
         self.is_connected = False
+        # CandleBuilder uses the global TF_MINUTES automatically
         self.candle       = CandleBuilder()
         self._snapshots   = []
 
@@ -337,26 +401,35 @@ class SpotStreamer:
                 ltpc = data['fullFeed']['indexFF'].get('ltpc', {})
                 ltp  = _to_float(ltpc.get('ltp', 0))
             if ltp > 0:
-                ts = get_ist_time()
-                if self.candle.tick(ltp, ts):
+                ts     = get_ist_time()
+                sealed = self.candle.tick(ltp, ts)
+
+                # Always keep the current bar's spot open stored so that when
+                # an option candle seals at the same boundary the lookup never
+                # returns None — even if the spot candle hasn't formally sealed.
+                cur_bar = _candle_start(ts, TF_MINUTES)
+                if self.candle._open is not None:
+                    self.shared.set_spot_open(cur_bar, self.candle._open)
+
+                if sealed:
                     closed = self.candle.get_last_closed()
                     if closed:
+                        # Explicitly store the just-sealed bar too (belt & braces)
                         self.shared.set_spot_open(closed['minute_dt'],
                                                    closed['open'])
                         print(f"  📈 Spot candle sealed: "
                               f"{closed['minute_dt'].strftime('%H:%M')}  "
-                              f"O={closed['open']:.2f}")
+                              f"O={closed['open']:.2f}  "
+                              f"(TF={TF_MINUTES}m)")
 
     def is_stale(self) -> bool:
         if not self.is_connected:
             self._snapshots.clear()
             return False
-
         ltp = self.candle._close or 0
         self._snapshots.append(ltp)
         if len(self._snapshots) > 15:
             self._snapshots.pop(0)
-
         return len(self._snapshots) == 15 and len(set(self._snapshots)) == 1
 
 
@@ -368,40 +441,34 @@ class OptionStreamer:
     """
     Subscribes to exactly 2 instruments: ATM CALL and ATM PUT.
     ATM strike is fixed at session start and never changes.
-    Writes exactly 2 CSV rows per completed 1-minute candle.
+    Writes exactly 2 CSV rows per completed TF-minute candle.
     """
 
     def __init__(self, access_token: str, shared: SharedState,
                  atm_strike: float, atm_keys: dict, expiry_date: str):
-        """
-        atm_keys : {'CALL': instrument_key, 'PUT': instrument_key}
-        """
         self.access_token = access_token
         self.shared       = shared
         self.atm_strike   = atm_strike
-        self.atm_keys     = atm_keys          # {'CALL': key, 'PUT': key}
+        self.atm_keys     = atm_keys
         self.expiry_date  = expiry_date
         self.streamer     = None
         self.is_connected = False
 
-        # One candle builder per option type
+        # One CandleBuilder per option leg — both use the global TF_MINUTES
         self._candles = {
             'CALL': CandleBuilder(),
             'PUT' : CandleBuilder(),
         }
-        # Reverse map: instrument_key → option_type
         self._key_to_type = {v: k for k, v in atm_keys.items()}
-
         self._market_ltp  = {}
         self._snapshots   = []
 
     def setup(self):
         cfg = upstox_client.Configuration()
         cfg.access_token = self.access_token
-        instrument_keys  = list(self.atm_keys.values())
         self.streamer = upstox_client.MarketDataStreamerV3(
             upstox_client.ApiClient(cfg),
-            instrument_keys,
+            list(self.atm_keys.values()),
             "full",
         )
         self.streamer.on("message", self._on_message)
@@ -409,7 +476,7 @@ class OptionStreamer:
         self.streamer.on("error",   self._on_error)
         self.streamer.on("close",   self._on_close)
         print(f"📡 Option streamer configured — ATM {self.atm_strike} "
-              f"(CALL + PUT only)")
+              f"(CALL + PUT only)  TF={TF_MINUTES}m")
 
     def connect(self):
         if self.streamer:
@@ -465,22 +532,21 @@ class OptionStreamer:
                                   f"O={closed['open']:.2f} "
                                   f"H={closed['high']:.2f} "
                                   f"L={closed['low']:.2f} "
-                                  f"C={closed['close']:.2f}")
+                                  f"C={closed['close']:.2f}  "
+                                  f"(TF={TF_MINUTES}m)")
 
     def _make_row(self, otype: str, candle: dict):
         """Build one CSV row dict for a completed option candle."""
-        minute_dt = candle['minute_dt']
-        spot_open = self.shared.get_spot_open(minute_dt)
+        bar_dt    = candle['minute_dt']   # naive datetime of bar open
+        spot_open = self.shared.get_spot_open(bar_dt)
 
         if spot_open is None:
-            # Spot candle for this minute not yet available — skip row
-            # This should be extremely rare since spot seals first
-            print(f"  ⚠️  spot_open missing for {minute_dt.strftime('%H:%M')} "
+            print(f"  ⚠️  spot_open missing for {bar_dt.strftime('%H:%M')} "
                   f"— row skipped")
             return None
 
-        date_str = minute_dt.strftime('%Y-%m-%d')
-        dt_str   = minute_dt.strftime('%Y-%m-%d %H:%M:%S')
+        date_str = bar_dt.strftime('%Y-%m-%d')
+        dt_str   = bar_dt.strftime('%Y-%m-%d %H:%M:%S')
 
         return {
             'datetime'    : dt_str,
@@ -499,12 +565,10 @@ class OptionStreamer:
         if not self.is_connected or not self._market_ltp:
             self._snapshots.clear()
             return False
-
         snap = dict(self._market_ltp)
         self._snapshots.append(snap)
         if len(self._snapshots) > 15:
             self._snapshots.pop(0)
-
         return (len(self._snapshots) == 15 and
                 all(s == self._snapshots[0] for s in self._snapshots))
 
@@ -567,7 +631,8 @@ class CSVWriter:
 # RECONNECT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _reconnect_spot(spot_stream: SpotStreamer, stop_event: threading.Event, attempt: int):
+def _reconnect_spot(spot_stream: SpotStreamer,
+                    stop_event: threading.Event, attempt: int):
     print(f"🔄 Spot reconnect attempt {attempt}…")
     try:
         spot_stream.disconnect()
@@ -580,15 +645,14 @@ def _reconnect_spot(spot_stream: SpotStreamer, stop_event: threading.Event, atte
         stop_event.wait(delay)
     spot_stream.setup()
     threading.Thread(target=spot_stream.connect, daemon=True).start()
-
-    # Wait for connection
     for _ in range(10):
         if spot_stream.is_connected or stop_event.is_set():
             break
         time.sleep(1)
 
 
-def _reconnect_option(opt_stream: OptionStreamer, stop_event: threading.Event, attempt: int):
+def _reconnect_option(opt_stream: OptionStreamer,
+                      stop_event: threading.Event, attempt: int):
     print(f"🔄 Option reconnect attempt {attempt}…")
     try:
         opt_stream.disconnect()
@@ -601,8 +665,6 @@ def _reconnect_option(opt_stream: OptionStreamer, stop_event: threading.Event, a
         stop_event.wait(delay)
     opt_stream.setup()
     threading.Thread(target=opt_stream.connect, daemon=True).start()
-
-    # Wait for connection
     for _ in range(10):
         if opt_stream.is_connected or stop_event.is_set():
             break
@@ -615,7 +677,8 @@ def _reconnect_option(opt_stream: OptionStreamer, stop_event: threading.Event, a
 
 def main():
     print("\n" + "=" * 70)
-    print("  T10 CSV COLLECTOR — Fixed ATM Strike | 1-Min Candles → CSV")
+    print(f"  T10 CSV COLLECTOR — Fixed ATM Strike | "
+          f"{TF_MINUTES}-Min Candles → CSV")
     print("=" * 70)
 
     # ── Load access token ─────────────────────────────────────────────────────
@@ -644,8 +707,8 @@ def main():
     print("  FETCHING OPTION CHAIN — calculating ATM strike")
     print("=" * 70)
 
-    oc         = UpstoxOptionChain(access_token)
-    full_chain = None
+    oc          = UpstoxOptionChain(access_token)
+    full_chain  = None
     expiry_date = None
 
     for attempt in range(1, 6):
@@ -683,6 +746,7 @@ def main():
         'atm_ce_key'  : atm_keys['CALL'],
         'atm_pe_key'  : atm_keys['PUT'],
         'spot_at_open': spot_price,
+        'tf_minutes'  : TF_MINUTES,            # written for strategy reference
     }
     with open('session_state.json', 'w') as _f:
         json.dump(_session_state, _f, indent=2)
@@ -690,9 +754,10 @@ def main():
     print(f"\n🔒 ATM Strike LOCKED: {atm_strike}  "
           f"(Spot at open: {spot_price:.2f})")
     print(f"   This strike will NOT change during the session.")
-    print(f"   Expiry: {expiry_date}")
+    print(f"   Expiry  : {expiry_date}")
+    print(f"   TF      : {TF_MINUTES} min  "
+          f"(bars anchored at 09:15 IST)")
     print(f"   ✅ session_state.json written — live_strategy will pick this up.")
-
 
     # ── Shared state & CSV writer ─────────────────────────────────────────────
     shared     = SharedState()
@@ -708,24 +773,19 @@ def main():
     print("=" * 70)
 
     spot_stream.setup()
-    spot_thread = threading.Thread(target=spot_stream.connect, daemon=True)
-    spot_thread.start()
+    threading.Thread(target=spot_stream.connect, daemon=True).start()
 
     opt_stream.setup()
-    opt_thread = threading.Thread(target=opt_stream.connect, daemon=True)
-    opt_thread.start()
+    threading.Thread(target=opt_stream.connect, daemon=True).start()
 
     print("⏳ Waiting 10s for initial connection…")
     time.sleep(10)
 
     spot_reconnects = 0
     opt_reconnects  = 0
-    max_reconnects  = 10
     rows_written    = 0
     last_log        = time.time()
-
-    # Stop event for clean exit and wait synchronization
-    stop_event = threading.Event()
+    stop_event      = threading.Event()
 
     try:
         while not stop_event.is_set():
@@ -746,7 +806,8 @@ def main():
             # ── Periodic status ────────────────────────────────────────────────
             if time.time() - last_log >= 30:
                 print(f"📊 {now.strftime('%H:%M:%S')} | "
-                      f"Rows written: {rows_written} | "
+                      f"TF={TF_MINUTES}m | "
+                      f"Rows: {rows_written} | "
                       f"Spot: {spot_stream.is_connected} | "
                       f"Options: {opt_stream.is_connected}")
                 last_log = time.time()
@@ -789,10 +850,11 @@ def main():
         if rows:
             csv_writer.flush(rows)
         print(f"\n✅ Session ended.")
-        print(f"   ATM Strike : {atm_strike}")
+        print(f"   ATM Strike  : {atm_strike}")
+        print(f"   TF          : {TF_MINUTES} min")
         print(f"   Rows written: {rows_written}")
         if csv_writer._csv_path:
-            print(f"   CSV saved  : {csv_writer._csv_path}")
+            print(f"   CSV saved   : {csv_writer._csv_path}")
 
 
 if __name__ == "__main__":
