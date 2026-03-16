@@ -14,7 +14,7 @@ TARGET_POINTS = 5
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
-TF_SECONDS    = 60           # must match live_straddle_strategy.py
+TF_SECONDS    = 30           # must match live_straddle_strategy.py
 CSV_COMBINED  = 'nifty_{date}.csv'
 DB_FILE       = 'gdfl_data.duckdb'
 
@@ -136,8 +136,8 @@ def _load_from_combined_csv(date_str, entry_sql_time):
     df = pd.read_csv(csv_file, parse_dates=['datetime'])
     df['datetime'] = pd.to_datetime(df['datetime'])
 
-    required = {'datetime', 'date', 'spot_open', 'expiry_date',
-                'strike_price', 'option_type', 'open', 'high', 'low', 'close'}
+    required = {'datetime', 'strike_price', 'option_type',
+                'open', 'high', 'low', 'close'}
     missing = required - set(df.columns)
     if missing:
         print(f"  ❌ CSV missing columns: {missing}")
@@ -146,18 +146,17 @@ def _load_from_combined_csv(date_str, entry_sql_time):
     entry_time_obj = datetime.strptime(entry_sql_time, '%H:%M:%S').time()
     df = df[
         (df['datetime'].dt.time >= entry_time_obj) &
-        (df['datetime'].dt.time <= time(15, 15))
+        (df['datetime'].dt.time <= time(15, 30))
     ].sort_values('datetime').reset_index(drop=True)
 
     if df.empty:
         return None, None
 
-    spot_df = (df[['datetime', 'spot_open']]
+    spot_df = (df[['datetime']]
                .drop_duplicates(subset='datetime')
-               .rename(columns={'spot_open': 'open'})
                .reset_index(drop=True))
 
-    opts_df = df[['datetime', 'expiry_date', 'strike_price',
+    opts_df = df[['datetime', 'strike_price',
                   'option_type', 'open', 'high', 'low', 'close']].copy()
 
     return spot_df, opts_df
@@ -172,11 +171,12 @@ def _load_from_db(con, date_str, entry_sql_time):
         return None, None
     expiry = expiry_res[0]
 
+    # spot_df used only for datetime spine — open column not used
     spot_df = con.execute(f"""
-        SELECT datetime, open FROM spot_data
+        SELECT datetime FROM spot_data
         WHERE date = '{date_str}'
         AND cast(datetime as time) >= '{entry_sql_time}'
-        AND cast(datetime as time) <= '15:15:00'
+        AND cast(datetime as time) <= '15:30:00'
         ORDER BY datetime
     """).fetchdf()
 
@@ -185,7 +185,7 @@ def _load_from_db(con, date_str, entry_sql_time):
         FROM options_data
         WHERE date = '{date_str}' AND expiry_date = '{expiry}'
         AND cast(datetime as time) >= '{entry_sql_time}'
-        AND cast(datetime as time) <= '15:15:00'
+        AND cast(datetime as time) <= '15:30:00'
         ORDER BY datetime
     """).fetchdf()
 
@@ -353,9 +353,8 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
             for _, spot_row in spot_day.iterrows():
                 candle_dt      = pd.to_datetime(spot_row['datetime'])
-                spot_open      = float(spot_row['open'])
                 candle_time    = candle_dt.time()
-                is_exit_candle = (candle_time == time(15, 15))
+                is_exit_candle = (candle_time == time(15, 30))
 
                 # ── Determine strike ───────────────────────────────────────────
                 if source == 'csv':
@@ -434,7 +433,6 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     closed_pnl     = sum(t['trade_pnl_val'] for t in day_trades)
                     print(
                         f"  [{date_str} {candle_dt.strftime('%H:%M')}]  "
-                        f"Spot: {spot_open:.0f} | "
                         f"Trade#{active['trade_num']}  "
                         f"CE({active['ce_strike']}): C={ce_close:.2f} | "
                         f"PE({active['pe_strike']}): C={pe_close:.2f} | "

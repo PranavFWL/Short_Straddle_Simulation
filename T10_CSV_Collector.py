@@ -13,10 +13,10 @@ CSV Format (matches backtest.py exactly):
   open, high, low, close
 
 Timeframe:
-  Set TF_MINUTES below. The candle grid is anchored at 09:15 IST.
-    TF_MINUTES = 1  → candles at 09:15, 09:16, 09:17, … (original behaviour)
-    TF_MINUTES = 3  → candles at 09:15, 09:18, 09:21, …
-    TF_MINUTES = 5  → candles at 09:15, 09:20, 09:25, …
+  Set TF_SECONDS below. The candle grid is anchored at 09:15:00 IST.
+    TF_SECONDS = 30  → 30s candles  (09:15:00, 09:15:30, 09:16:00 …)
+    TF_SECONDS = 60  → 1-min candles (09:15:00, 09:16:00, 09:17:00 …)
+    TF_SECONDS = 180 → 3-min candles (09:15:00, 09:18:00, 09:21:00 …)
 
 Run:
     python T10_CSV_Collector.py
@@ -47,19 +47,21 @@ MAX_RECONNECTS = 10
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ── Timeframe ─────────────────────────────────────────────────────────────────
-# Controls candle width. Must match TF_MINUTES in live_strategy.py.
+# Controls candle width in SECONDS. The bar grid is anchored at 09:15:00 IST.
 #
-#   TF_MINUTES = 1  → 1-min candles  (original behaviour)
-#   TF_MINUTES = 3  → 3-min candles  (bars: 09:15, 09:18, 09:21 …)
-#   TF_MINUTES = 5  → 5-min candles  (bars: 09:15, 09:20, 09:25 …)
+#   TF_SECONDS = 30   → 30-sec candles  (bars: 09:15:00, 09:15:30, 09:16:00 …)
+#   TF_SECONDS = 60   → 1-min candles   (bars: 09:15:00, 09:16:00, 09:17:00 …)
+#   TF_SECONDS = 180  → 3-min candles   (bars: 09:15:00, 09:18:00, 09:21:00 …)
+#   TF_SECONDS = 300  → 5-min candles   (bars: 09:15:00, 09:20:00, 09:25:00 …)
 #
-# The bar grid is always anchored at 09:15 IST (market open).
+# Must match TF_SECONDS in live_strategy.py.
 # ─────────────────────────────────────────────────────────────────────────────
-TF_MINUTES = 1
+TF_SECONDS = 30
 
-# Anchor for the bar grid — must stay at market open (09:15)
+# Anchor for the bar grid — market open (09:15:00 IST), never changes
 _CANDLE_ANCHOR_H = 9
 _CANDLE_ANCHOR_M = 15
+_CANDLE_ANCHOR_S = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,29 +96,34 @@ def _to_float(v, default=0.0):
     except: return default
 
 
-def _candle_start(ts: datetime, tf: int) -> datetime:
+def _candle_start(ts: datetime, tf_seconds: int) -> datetime:
     """
-    Return the TF-minute bar-open datetime that *ts* belongs to,
-    anchored at 09:15 IST on the same calendar date.
+    Return the bar-open datetime that *ts* belongs to, anchored at
+    09:15:00 IST and repeating every tf_seconds seconds.
 
-    The result has tzinfo stripped (naive) so it can be used as a
-    dict key without timezone ambiguity.
+    Result is naive (tzinfo stripped) for use as a dict key.
 
-    Examples (TF=3, anchor=09:15):
-        09:15:00 → 09:15   09:17:42 → 09:15   09:18:00 → 09:18
-        09:20:59 → 09:18   09:21:00 → 09:21
+    Examples (TF_SECONDS=30, anchor=09:15:00):
+        09:15:00 → 09:15:00   09:15:29 → 09:15:00   09:15:30 → 09:15:30
+        09:16:59 → 09:16:30   09:18:00 → 09:18:00
+
+    Examples (TF_SECONDS=60):
+        09:15:00 → 09:15:00   09:15:59 → 09:15:00   09:16:00 → 09:16:00
+
+    Examples (TF_SECONDS=180, i.e. 3 min):
+        09:15:00 → 09:15:00   09:17:59 → 09:15:00   09:18:00 → 09:18:00
     """
     ts_naive = ts.replace(tzinfo=None)
     anchor   = ts_naive.replace(
         hour=_CANDLE_ANCHOR_H, minute=_CANDLE_ANCHOR_M,
-        second=0, microsecond=0)
+        second=_CANDLE_ANCHOR_S, microsecond=0)
 
     if ts_naive < anchor:
-        return anchor                          # before market open — use first bar
+        return anchor                          # before market open — first bar
 
-    elapsed_minutes = int((ts_naive - anchor).total_seconds() // 60)
-    bar_offset      = (elapsed_minutes // tf) * tf
-    return anchor + timedelta(minutes=bar_offset)
+    elapsed = int((ts_naive - anchor).total_seconds())
+    offset  = (elapsed // tf_seconds) * tf_seconds
+    return anchor + timedelta(seconds=offset)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,47 +132,43 @@ def _candle_start(ts: datetime, tf: int) -> datetime:
 
 class CandleBuilder:
     """
-    Accumulates tick data and closes a TF-minute OHLC candle.
+    Accumulates tick data and closes a TF_SECONDS OHLC candle.
     Only seals completed candles — no partial candle data is ever written.
 
-    The bar boundary is computed via _candle_start(), so changing TF_MINUTES
-    automatically widens or narrows every candle with no other code changes.
+    The bar boundary is computed via _candle_start(), so changing TF_SECONDS
+    automatically adjusts candle width with no other code changes.
     """
 
-    def __init__(self, tf_minutes: int = TF_MINUTES):
-        self._tf         = tf_minutes
+    def __init__(self, tf_seconds: int = TF_SECONDS):
+        self._tf         = tf_seconds
         self._lock       = threading.Lock()
         self._candle_bar = None   # naive datetime of current bar open
         self._open       = None
         self._high       = None
         self._low        = None
         self._close      = None
-        self.last_closed = None   # {bar_dt, open, high, low, close}
+        self.last_closed = None   # {minute_dt, open, high, low, close}
 
     def tick(self, ltp: float, ts: datetime) -> bool:
         """
         Feed a tick. Returns True when a candle just sealed.
-
-        A candle seals when the first tick of a NEW bar arrives —
-        identical to the original 1-minute logic, but the boundary is now
-        every TF_MINUTES minutes anchored at 09:15.
+        A candle seals when the first tick of a NEW bar arrives.
         """
         if ltp <= 0:
             return False
 
-        bar_dt = _candle_start(ts, self._tf)   # naive bar-open datetime
+        bar_dt = _candle_start(ts, self._tf)
         closed = False
 
         with self._lock:
             if self._candle_bar is None:
-                # First ever tick
                 self._open_candle(bar_dt, ltp)
 
             elif bar_dt > self._candle_bar:
-                # Tick belongs to a NEW bar — seal the completed bar first
+                # Seal the completed bar
                 self.last_closed = {
-                    'minute_dt': self._candle_bar,   # kept as 'minute_dt' for
-                    'open'     : self._open,          # compatibility with callers
+                    'minute_dt': self._candle_bar,   # key name kept for compatibility
+                    'open'     : self._open,
                     'high'     : self._high,
                     'low'      : self._low,
                     'close'    : self._close,
@@ -350,7 +353,7 @@ class SpotStreamer:
         self.shared       = shared
         self.streamer     = None
         self.is_connected = False
-        # CandleBuilder uses the global TF_MINUTES automatically
+        # CandleBuilder uses the global TF_SECONDS automatically
         self.candle       = CandleBuilder()
         self._snapshots   = []
 
@@ -407,7 +410,7 @@ class SpotStreamer:
                 # Always keep the current bar's spot open stored so that when
                 # an option candle seals at the same boundary the lookup never
                 # returns None — even if the spot candle hasn't formally sealed.
-                cur_bar = _candle_start(ts, TF_MINUTES)
+                cur_bar = _candle_start(ts, TF_SECONDS)
                 if self.candle._open is not None:
                     self.shared.set_spot_open(cur_bar, self.candle._open)
 
@@ -420,7 +423,7 @@ class SpotStreamer:
                         print(f"  📈 Spot candle sealed: "
                               f"{closed['minute_dt'].strftime('%H:%M')}  "
                               f"O={closed['open']:.2f}  "
-                              f"(TF={TF_MINUTES}m)")
+                              f"(TF={TF_SECONDS}s)")
 
     def is_stale(self) -> bool:
         if not self.is_connected:
@@ -454,7 +457,7 @@ class OptionStreamer:
         self.streamer     = None
         self.is_connected = False
 
-        # One CandleBuilder per option leg — both use the global TF_MINUTES
+        # One CandleBuilder per option leg — both use the global TF_SECONDS
         self._candles = {
             'CALL': CandleBuilder(),
             'PUT' : CandleBuilder(),
@@ -476,7 +479,7 @@ class OptionStreamer:
         self.streamer.on("error",   self._on_error)
         self.streamer.on("close",   self._on_close)
         print(f"📡 Option streamer configured — ATM {self.atm_strike} "
-              f"(CALL + PUT only)  TF={TF_MINUTES}m")
+              f"(CALL + PUT only)  TF={TF_SECONDS}s")
 
     def connect(self):
         if self.streamer:
@@ -533,26 +536,15 @@ class OptionStreamer:
                                   f"H={closed['high']:.2f} "
                                   f"L={closed['low']:.2f} "
                                   f"C={closed['close']:.2f}  "
-                                  f"(TF={TF_MINUTES}m)")
+                                  f"(TF={TF_SECONDS}s)")
 
     def _make_row(self, otype: str, candle: dict):
         """Build one CSV row dict for a completed option candle."""
-        bar_dt    = candle['minute_dt']   # naive datetime of bar open
-        spot_open = self.shared.get_spot_open(bar_dt)
-
-        if spot_open is None:
-            print(f"  ⚠️  spot_open missing for {bar_dt.strftime('%H:%M')} "
-                  f"— row skipped")
-            return None
-
-        date_str = bar_dt.strftime('%Y-%m-%d')
-        dt_str   = bar_dt.strftime('%Y-%m-%d %H:%M:%S')
+        bar_dt = candle['minute_dt']   # naive datetime of bar open
+        dt_str = bar_dt.strftime('%Y-%m-%d %H:%M:%S')
 
         return {
             'datetime'    : dt_str,
-            'date'        : date_str,
-            'spot_open'   : f"{spot_open:.2f}",
-            'expiry_date' : self.expiry_date,
             'strike_price': f"{self.atm_strike:.1f}",
             'option_type' : otype,
             'open'        : f"{candle['open']:.2f}",
@@ -578,8 +570,8 @@ class OptionStreamer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 CSV_COLUMNS = [
-    'datetime', 'date', 'spot_open', 'expiry_date',
-    'strike_price', 'option_type', 'open', 'high', 'low', 'close',
+    'datetime', 'strike_price', 'option_type',
+    'open', 'high', 'low', 'close',
 ]
 
 class CSVWriter:
@@ -678,7 +670,7 @@ def _reconnect_option(opt_stream: OptionStreamer,
 def main():
     print("\n" + "=" * 70)
     print(f"  T10 CSV COLLECTOR — Fixed ATM Strike | "
-          f"{TF_MINUTES}-Min Candles → CSV")
+          f"{TF_SECONDS}s Candles → CSV")
     print("=" * 70)
 
     # ── Load access token ─────────────────────────────────────────────────────
@@ -746,7 +738,7 @@ def main():
         'atm_ce_key'  : atm_keys['CALL'],
         'atm_pe_key'  : atm_keys['PUT'],
         'spot_at_open': spot_price,
-        'tf_minutes'  : TF_MINUTES,            # written for strategy reference
+        'tf_seconds'  : TF_SECONDS,            # written for strategy reference
     }
     with open('session_state.json', 'w') as _f:
         json.dump(_session_state, _f, indent=2)
@@ -755,7 +747,7 @@ def main():
           f"(Spot at open: {spot_price:.2f})")
     print(f"   This strike will NOT change during the session.")
     print(f"   Expiry  : {expiry_date}")
-    print(f"   TF      : {TF_MINUTES} min  "
+    print(f"   TF      : {TF_SECONDS}s  "
           f"(bars anchored at 09:15 IST)")
     print(f"   ✅ session_state.json written — live_strategy will pick this up.")
 
@@ -806,7 +798,7 @@ def main():
             # ── Periodic status ────────────────────────────────────────────────
             if time.time() - last_log >= 30:
                 print(f"📊 {now.strftime('%H:%M:%S')} | "
-                      f"TF={TF_MINUTES}m | "
+                      f"TF={TF_SECONDS}s | "
                       f"Rows: {rows_written} | "
                       f"Spot: {spot_stream.is_connected} | "
                       f"Options: {opt_stream.is_connected}")
@@ -851,7 +843,7 @@ def main():
             csv_writer.flush(rows)
         print(f"\n✅ Session ended.")
         print(f"   ATM Strike  : {atm_strike}")
-        print(f"   TF          : {TF_MINUTES} min")
+        print(f"   TF          : {TF_SECONDS}s")
         print(f"   Rows written: {rows_written}")
         if csv_writer._csv_path:
             print(f"   CSV saved   : {csv_writer._csv_path}")
