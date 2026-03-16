@@ -9,8 +9,8 @@ import os
 import glob
 
 
-SL_POINTS     = 20
-TARGET_POINTS = 5
+SL_POINTS     = 10
+TARGET_POINTS = 10
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
