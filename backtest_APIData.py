@@ -1,37 +1,220 @@
+"""
+backtest.py  —  Short Straddle Backtest + Live Upstox Fetch (single file)
+
+─────────────────────────────────────────────────────────────────────────────
+MODE 1 — Live fetch + backtest  (all four flags required, no CSV written)
+─────────────────────────────────────────────────────────────────────────────
+    python backtest.py --date 2026-03-17 --strike 23450 --start 11:36 --end 13:06
+    python backtest.py --date 2026-03-17 --strike 23450 --start 09:16 --end 15:15 --sl 40 --target 35
+
+─────────────────────────────────────────────────────────────────────────────
+MODE 2 — Classic backtest from CSV / DuckDB  (original behaviour, unchanged)
+─────────────────────────────────────────────────────────────────────────────
+    python backtest.py                          # all CSV/DB dates
+    python backtest.py --date 2026-03-17        # one date from CSV/DB
+    python backtest.py --time 09:20 --sl 40     # custom params, all dates
+"""
+
 import duckdb
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import time, datetime
+from datetime import time, datetime, timedelta
 from tabulate import tabulate
 import argparse
 import os
+import sys
 import glob
+import requests
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
 
 SL_POINTS     = 15
 TARGET_POINTS = 15
 LOT_SIZE      = 65
 COST_PERCENT  = 0.0025
 
-TF_SECONDS    = 60           # must match live_straddle_strategy.py
+TF_SECONDS    = 60
 CSV_COMBINED  = 'nifty_{date}.csv'
 DB_FILE       = 'gdfl_data.duckdb'
 
+TOKEN_FILE      = "upstox_token.txt"
+BASE_URL        = "https://api.upstox.com/v2"
+NIFTY_INDEX_KEY = "NSE_INDEX|Nifty 50"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
+# UPSTOX FETCH HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_token() -> str:
+    if not os.path.exists(TOKEN_FILE):
+        sys.exit(f"[ERROR] Token file '{TOKEN_FILE}' not found in current directory.")
+    token = open(TOKEN_FILE).read().strip()
+    if not token:
+        sys.exit(f"[ERROR] Token file '{TOKEN_FILE}' is empty.")
+    return token
+
+
+def _api_headers(token: str) -> dict:
+    return {
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def _nearest_expiry(token: str, trade_date: str) -> str:
+    """Return the nearest expiry on or after trade_date."""
+    resp = requests.get(
+        f"{BASE_URL}/option/contract",
+        headers=_api_headers(token),
+        params={"instrument_key": NIFTY_INDEX_KEY},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    contracts = resp.json().get("data", [])
+    if not contracts:
+        sys.exit("[ERROR] No expiry dates returned from Upstox.")
+
+    trade_dt = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    expiry_dates = set()
+    for c in contracts:
+        exp = c.get("expiry") if isinstance(c, dict) else c
+        if exp:
+            expiry_dates.add(exp)
+
+    future = sorted(
+        e for e in expiry_dates
+        if datetime.strptime(e, "%Y-%m-%d").date() >= trade_dt
+    )
+    if not future:
+        sys.exit(f"[ERROR] No expiry on or after {trade_date}.")
+    print(f"[FETCH] Nearest expiry: {future[0]}")
+    return future[0]
+
+
+def _option_chain(token: str, expiry: str) -> list:
+    resp = requests.get(
+        f"{BASE_URL}/option/chain",
+        headers=_api_headers(token),
+        params={"instrument_key": NIFTY_INDEX_KEY, "expiry_date": expiry},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("data", [])
+
+
+def _strike_keys(chain: list, strike: float) -> dict:
+    for item in chain:
+        if float(item.get("strike_price", -1)) == strike:
+            ce_key = (item.get("call_options") or {}).get("instrument_key")
+            pe_key = (item.get("put_options")  or {}).get("instrument_key")
+            if not ce_key or not pe_key:
+                sys.exit(f"[ERROR] CE or PE instrument_key missing for strike {strike}.")
+            return {"CE": ce_key, "PE": pe_key}
+    sys.exit(
+        f"[ERROR] Strike {int(strike)} not found in option chain. "
+        "Verify the strike is valid for this expiry."
+    )
+
+
+def _intraday_candles(token: str, instrument_key: str) -> list:
+    encoded = requests.utils.quote(instrument_key, safe="")
+    resp = requests.get(
+        f"{BASE_URL}/historical-candle/intraday/{encoded}/1minute",
+        headers=_api_headers(token),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("data", {}).get("candles", [])
+
+
+def _candles_to_df(candles: list, strike: float, opt_type: str) -> pd.DataFrame:
+    """API candle: [timestamp, open, high, low, close, volume, oi]"""
+    rows = []
+    for c in candles:
+        dt = datetime.fromisoformat(c[0]).replace(tzinfo=None)
+        rows.append({
+            "datetime":     dt,
+            "strike_price": strike,
+            "option_type":  "CALL" if opt_type == "CE" else "PUT",
+            "open":         float(c[1]),
+            "high":         float(c[2]),
+            "low":          float(c[3]),
+            "close":        float(c[4]),
+        })
+    df = pd.DataFrame(rows)
+    return df.sort_values("datetime").reset_index(drop=True)
+
+
+def fetch_data_in_memory(trade_date: str, strike: float,
+                         start_time: str, end_time: str) -> pd.DataFrame:
+    """
+    Fetch CE + PE 1-min candles from Upstox, filter to [start_time, end_time],
+    return a combined DataFrame — nothing written to disk.
+    """
+    print(f"\n[FETCH] Date={trade_date}  Strike={int(strike)}  "
+          f"Window={start_time}–{end_time}")
+
+    token  = _load_token()
+    expiry = _nearest_expiry(token, trade_date)
+    chain  = _option_chain(token, expiry)
+    if not chain:
+        sys.exit("[ERROR] Empty option chain returned.")
+
+    keys = _strike_keys(chain, strike)
+    print(f"[FETCH] CE key : {keys['CE']}")
+    print(f"[FETCH] PE key : {keys['PE']}")
+
+    print("[FETCH] Downloading CE candles ...")
+    ce_candles = _intraday_candles(token, keys["CE"])
+    print(f"[FETCH] CE candles received: {len(ce_candles)}")
+
+    print("[FETCH] Downloading PE candles ...")
+    pe_candles = _intraday_candles(token, keys["PE"])
+    print(f"[FETCH] PE candles received: {len(pe_candles)}")
+
+    if not ce_candles and not pe_candles:
+        sys.exit("[ERROR] No candle data returned for CE or PE.")
+
+    df_all = pd.concat(
+        [_candles_to_df(ce_candles, strike, "CE"),
+         _candles_to_df(pe_candles, strike, "PE")],
+        ignore_index=True,
+    )
+    df_all["datetime"] = pd.to_datetime(df_all["datetime"])
+
+    t_start = datetime.strptime(start_time, "%H:%M").time()
+    t_end   = datetime.strptime(end_time,   "%H:%M").time()
+    mask    = (df_all["datetime"].dt.time >= t_start) & \
+              (df_all["datetime"].dt.time <= t_end)
+    df_all  = df_all[mask].sort_values("datetime").reset_index(drop=True)
+
+    if df_all.empty:
+        sys.exit(f"[ERROR] No data in window {start_time}–{end_time} "
+                 f"for {trade_date} strike {int(strike)}.")
+
+    n_ce = (df_all["option_type"] == "CALL").sum()
+    n_pe = (df_all["option_type"] == "PUT").sum()
+    print(f"[FETCH] Rows after time filter: {len(df_all)}  "
+          f"(CE: {n_ce}, PE: {n_pe})\n")
+    return df_all
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PnL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _leg_cost(entry, exit_price):
-    """Transaction cost for one leg."""
     return (entry + exit_price) * COST_PERCENT
 
 
 def _leg_pnl_time(entry, exit_price):
-    """PnL for time exit — actual prices used."""
-    cost = _leg_cost(entry, exit_price)
-    return (entry - exit_price) - cost
+    return (entry - exit_price) - _leg_cost(entry, exit_price)
 
 
 def _atm(spot):
@@ -39,30 +222,18 @@ def _atm(spot):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BAR-ALIGNMENT HELPERS  (mirror of live_straddle_strategy.py)
+# BAR-ALIGNMENT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _bar_open_for(ts: datetime, entry_h: int, entry_m: int,
-                  tf_seconds: int) -> datetime:
-    """
-    Return the bar-open datetime that *ts* belongs to, aligned to the
-    tf_seconds grid anchored at entry_h:entry_m:00 on the same date.
-    Result is naive (no tzinfo).
-    """
-    anchor = ts.replace(hour=entry_h, minute=entry_m,
-                        second=0, microsecond=0)
+def _bar_open_for(ts, entry_h, entry_m, tf_seconds):
+    anchor  = ts.replace(hour=entry_h, minute=entry_m, second=0, microsecond=0)
     if ts < anchor:
         return anchor
     elapsed = int((ts - anchor).total_seconds())
-    offset  = (elapsed // tf_seconds) * tf_seconds
-    from datetime import timedelta
-    return anchor + timedelta(seconds=offset)
+    return anchor + timedelta(seconds=(elapsed // tf_seconds) * tf_seconds)
 
 
-def _next_bar_open(ts: datetime, entry_h: int, entry_m: int,
-                   tf_seconds: int) -> datetime:
-    """Return the next bar-open after *ts* on the tf_seconds grid."""
-    from datetime import timedelta
+def _next_bar_open(ts, entry_h, entry_m, tf_seconds):
     return _bar_open_for(ts, entry_h, entry_m, tf_seconds) + timedelta(seconds=tf_seconds)
 
 
@@ -75,30 +246,19 @@ def print_trade_summary(completed_trades):
         print("\nNo completed trades to display.")
         return
 
-    headers = [
-        "#", "Leg", "Strike",
-        "Entry Time", "Exit Time",
-        "Entry ₹", "Exit ₹",
-        "Leg PnL (₹)", "Trade PnL (₹)", "Reason"
-    ]
-
+    headers = ["#", "Leg", "Strike", "Entry Time", "Exit Time",
+               "Entry ₹", "Exit ₹", "Leg PnL (₹)", "Trade PnL (₹)", "Reason"]
     rows = []
     for i, t in enumerate(completed_trades, start=1):
-        rows.append([
-            i, "CE", t['ce_strike'],
-            t['ce_entry_time'], t['ce_exit_time'],
-            f"{t['ce_entry']:.2f}", f"{t['ce_exit']:.2f}",
-            f"{t['ce_pnl_val']:+.2f}",
-            f"{t['trade_pnl_val']:+.2f}",
-            t['exit_reason'],
-        ])
-        rows.append([
-            "", "PE", t['pe_strike'],
-            t['pe_entry_time'], t['pe_exit_time'],
-            f"{t['pe_entry']:.2f}", f"{t['pe_exit']:.2f}",
-            f"{t['pe_pnl_val']:+.2f}",
-            "", "",
-        ])
+        rows.append([i, "CE", t['ce_strike'],
+                     t['ce_entry_time'], t['ce_exit_time'],
+                     f"{t['ce_entry']:.2f}", f"{t['ce_exit']:.2f}",
+                     f"{t['ce_pnl_val']:+.2f}", f"{t['trade_pnl_val']:+.2f}",
+                     t['exit_reason']])
+        rows.append(["", "PE", t['pe_strike'],
+                     t['pe_entry_time'], t['pe_exit_time'],
+                     f"{t['pe_entry']:.2f}", f"{t['pe_exit']:.2f}",
+                     f"{t['pe_pnl_val']:+.2f}", "", ""])
 
     print("\n" + "=" * 110)
     print("  BACKTEST TRADE SUMMARY  (completed trades only)")
@@ -106,26 +266,23 @@ def print_trade_summary(completed_trades):
     print(tabulate(rows, headers=headers, tablefmt="rounded_outline",
                    stralign="center", numalign="center"))
 
-    total_trades = len(completed_trades)
-    wins         = sum(1 for t in completed_trades if t['trade_pnl_val'] > 0)
-    losses       = total_trades - wins
-    total_pnl    = sum(t['trade_pnl_val'] for t in completed_trades)
-    best         = max(completed_trades, key=lambda t: t['trade_pnl_val'])
-    worst        = min(completed_trades, key=lambda t: t['trade_pnl_val'])
+    total  = len(completed_trades)
+    wins   = sum(1 for t in completed_trades if t['trade_pnl_val'] > 0)
+    total_pnl = sum(t['trade_pnl_val'] for t in completed_trades)
+    best   = max(completed_trades, key=lambda t: t['trade_pnl_val'])
+    worst  = min(completed_trades, key=lambda t: t['trade_pnl_val'])
 
-    print(f"\n  Total Trades  : {total_trades}")
-    print(f"  Winners       : {wins}  ({wins / total_trades * 100:.1f}%)")
-    print(f"  Losers        : {losses}  ({losses / total_trades * 100:.1f}%)")
-    print(f"  Best Trade    : ₹{best['trade_pnl_val']:+.2f}  "
-          f"(entered {best['ce_entry_time']})")
-    print(f"  Worst Trade   : ₹{worst['trade_pnl_val']:+.2f}  "
-          f"(entered {worst['ce_entry_time']})")
+    print(f"\n  Total Trades  : {total}")
+    print(f"  Winners       : {wins}  ({wins/total*100:.1f}%)")
+    print(f"  Losers        : {total-wins}  ({(total-wins)/total*100:.1f}%)")
+    print(f"  Best Trade    : ₹{best['trade_pnl_val']:+.2f}  (entered {best['ce_entry_time']})")
+    print(f"  Worst Trade   : ₹{worst['trade_pnl_val']:+.2f}  (entered {worst['ce_entry_time']})")
     print(f"  Total Net PnL : ₹{total_pnl:+,.2f}")
     print("=" * 110 + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA LOADING
+# DATA LOADING  (CSV / DuckDB — original paths, used in Mode 2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_from_combined_csv(date_str, entry_sql_time):
@@ -136,9 +293,8 @@ def _load_from_combined_csv(date_str, entry_sql_time):
     df = pd.read_csv(csv_file, parse_dates=['datetime'])
     df['datetime'] = pd.to_datetime(df['datetime'])
 
-    required = {'datetime', 'strike_price', 'option_type',
-                'open', 'high', 'low', 'close'}
-    missing = required - set(df.columns)
+    required = {'datetime', 'strike_price', 'option_type', 'open', 'high', 'low', 'close'}
+    missing  = required - set(df.columns)
     if missing:
         print(f"  ❌ CSV missing columns: {missing}")
         return None, None
@@ -152,13 +308,9 @@ def _load_from_combined_csv(date_str, entry_sql_time):
     if df.empty:
         return None, None
 
-    spot_df = (df[['datetime']]
-               .drop_duplicates(subset='datetime')
-               .reset_index(drop=True))
-
-    opts_df = df[['datetime', 'strike_price',
-                  'option_type', 'open', 'high', 'low', 'close']].copy()
-
+    spot_df = df[['datetime']].drop_duplicates(subset='datetime').reset_index(drop=True)
+    opts_df = df[['datetime', 'strike_price', 'option_type',
+                  'open', 'high', 'low', 'close']].copy()
     return spot_df, opts_df
 
 
@@ -171,12 +323,11 @@ def _load_from_db(con, date_str, entry_sql_time):
         return None, None
     expiry = expiry_res[0]
 
-    # spot_df used only for datetime spine — open column not used
     spot_df = con.execute(f"""
         SELECT datetime FROM spot_data
         WHERE date = '{date_str}'
-        AND cast(datetime as time) >= '{entry_sql_time}'
-        AND cast(datetime as time) <= '15:30:00'
+          AND cast(datetime as time) >= '{entry_sql_time}'
+          AND cast(datetime as time) <= '15:30:00'
         ORDER BY datetime
     """).fetchdf()
 
@@ -184,8 +335,8 @@ def _load_from_db(con, date_str, entry_sql_time):
         SELECT datetime, strike_price, option_type, open, high, low, close
         FROM options_data
         WHERE date = '{date_str}' AND expiry_date = '{expiry}'
-        AND cast(datetime as time) >= '{entry_sql_time}'
-        AND cast(datetime as time) <= '15:30:00'
+          AND cast(datetime as time) >= '{entry_sql_time}'
+          AND cast(datetime as time) <= '15:30:00'
         ORDER BY datetime
     """).fetchdf()
 
@@ -195,9 +346,8 @@ def _load_from_db(con, date_str, entry_sql_time):
 
 
 def _get_csv_dates():
-    files = glob.glob(CSV_COMBINED.replace('{date}', '*'))
     dates = []
-    for f in sorted(files):
+    for f in sorted(glob.glob(CSV_COMBINED.replace('{date}', '*'))):
         base     = os.path.basename(f)
         date_str = base.replace('nifty_', '').replace('.csv', '')
         try:
@@ -217,34 +367,40 @@ def _get_db_dates(con):
     ]
 
 
+def _prepare_injected(df: pd.DataFrame, entry_sql_time: str):
+    """Convert in-memory live DataFrame into (spot_df, opts_df)."""
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+
+    entry_time_obj = datetime.strptime(entry_sql_time, '%H:%M:%S').time()
+    df = df[
+        (df['datetime'].dt.time >= entry_time_obj) &
+        (df['datetime'].dt.time <= time(15, 15))
+    ].sort_values('datetime').reset_index(drop=True)
+
+    if df.empty:
+        return None, None
+
+    spot_df = df[['datetime']].drop_duplicates(subset='datetime').reset_index(drop=True)
+    opts_df = df[['datetime', 'strike_price', 'option_type',
+                  'open', 'high', 'low', 'close']].copy()
+    return spot_df, opts_df
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN BACKTEST
-#
-# KEY DESIGN — SL / Target detection per candle:
-#
-#   SL   : Either leg's HIGH >= that leg's SL price.
-#           Fixed -SL_POINTS per leg deducted (+ costs).
-#           Exit prices for record: ce_sl, pe_sl.
-#
-#   Target: Checked ONLY when NO leg has hit SL.
-#           Combined drop on CLOSE prices >= TARGET_POINTS.
-#               (ce_entry - ce_close) + (pe_entry - pe_close) >= TARGET
-#           Rationale: within one candle we cannot know whether the high
-#           (SL touch) came before or after the low. If SL fired on one
-#           leg, that leg's low is irrelevant — the trade was already
-#           closed. Using CLOSE avoids the contradictory scenario where
-#           the same candle's HIGH hits SL and LOW gives a target.
-#           Fixed +TARGET_POINTS per leg added (+ costs).
-#
-#   Time : 15:15 candle close — actual prices used.
-#
-#   Re-entry: next candle after SL or Target exit.
+# MAIN BACKTEST ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                  target_points=TARGET_POINTS, date_filter=None,
-                 tf_seconds=TF_SECONDS, quiet=False):
-
+                 tf_seconds=TF_SECONDS, quiet=False,
+                 injected_df: pd.DataFrame = None):
+    """
+    injected_df : pre-built in-memory DataFrame from live Upstox fetch.
+                  When supplied, all CSV / DuckDB loading is skipped.
+                  Required columns: datetime, strike_price, option_type,
+                                    open, high, low, close
+    """
     try:
         entry_h, entry_m = map(int, entry_time_str.split(':'))
         entry_sql_time   = f"{entry_time_str}:00"
@@ -259,32 +415,34 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
             print("Invalid date format. Use YYYY-MM-DD")
             return pd.DataFrame(), []
 
-    # ── Build date → source list ───────────────────────────────────────────────
-    date_sources = []
-
-    if date_filter:
-        csv_file = CSV_COMBINED.format(date=date_filter)
-        if os.path.exists(csv_file):
-            date_sources.append((date_filter, 'csv'))
-            if not quiet:
-                print(f"  📄 {date_filter} → {csv_file}")
-        else:
-            date_sources.append((date_filter, 'db'))
-            if not quiet:
-                print(f"  🗄️  {date_filter} → DuckDB")
+    # ── Build date→source list ─────────────────────────────────────────────────
+    if injected_df is not None:
+        date_sources = [(date_filter, 'injected')]
     else:
-        csv_dates = set(_get_csv_dates())
-        db_dates  = set()
-        if os.path.exists(DB_FILE):
-            _con = duckdb.connect(DB_FILE, read_only=True)
-            db_dates = set(_get_db_dates(_con))
-            _con.close()
-        for d in sorted(csv_dates | db_dates):
-            date_sources.append((d, 'csv' if d in csv_dates else 'db'))
+        date_sources = []
+        if date_filter:
+            csv_file = CSV_COMBINED.format(date=date_filter)
+            if os.path.exists(csv_file):
+                date_sources.append((date_filter, 'csv'))
+                if not quiet:
+                    print(f"  📄 {date_filter} → {csv_file}")
+            else:
+                date_sources.append((date_filter, 'db'))
+                if not quiet:
+                    print(f"  🗄️  {date_filter} → DuckDB")
+        else:
+            csv_dates = set(_get_csv_dates())
+            db_dates  = set()
+            if os.path.exists(DB_FILE):
+                _con = duckdb.connect(DB_FILE, read_only=True)
+                db_dates = set(_get_db_dates(_con))
+                _con.close()
+            for d in sorted(csv_dates | db_dates):
+                date_sources.append((d, 'csv' if d in csv_dates else 'db'))
 
-    if not date_sources:
-        print("No data found. Check CSV files or DuckDB.")
-        return pd.DataFrame(), []
+        if not date_sources:
+            print("No data found. Check CSV files or DuckDB.")
+            return pd.DataFrame(), []
 
     con = None
     if any(s == 'db' for _, s in date_sources):
@@ -295,9 +453,12 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
             date_sources = [(d, s) for d, s in date_sources if s == 'csv']
 
     if not quiet:
-        date_label = date_filter if date_filter else f"ALL ({len(date_sources)} days)"
+        if injected_df is not None:
+            src_label = f"Live API  ({date_filter}  strike auto-detected)"
+        else:
+            src_label = date_filter if date_filter else f"ALL ({len(date_sources)} days)"
         print(f"\nFound {len(date_sources)} trading day(s).")
-        print(f"Parameters : Date   = {date_label}")
+        print(f"Parameters : Date   = {src_label}")
         print(f"           : Entry  = {entry_time_str}")
         print(f"           : SL     = {sl_points} pts/leg (fixed deduction)")
         print(f"           : Target = {target_points} pts/leg (fixed)")
@@ -310,7 +471,10 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
 
     for date_str, source in date_sources:
         try:
-            if source == 'csv':
+            # ── Load data ──────────────────────────────────────────────────────
+            if source == 'injected':
+                spot_day, opts_day = _prepare_injected(injected_df, entry_sql_time)
+            elif source == 'csv':
                 spot_day, opts_day = _load_from_combined_csv(date_str, entry_sql_time)
             else:
                 spot_day, opts_day = _load_from_db(con, date_str, entry_sql_time)
@@ -330,12 +494,13 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
             )
             opts_idx = opts_day.set_index(['dt', 'strike_price', 'option_type'])
 
-            # ── Strike mode ────────────────────────────────────────────────────
+            # ── Strike resolution ──────────────────────────────────────────────
             unique_strikes = opts_day['strike_price'].unique()
-            if source == 'csv' and len(unique_strikes) == 1:
+            if source in ('injected', 'csv') and len(unique_strikes) == 1:
                 fixed_strike = float(unique_strikes[0])
+                label = "live fetch" if source == 'injected' else "CSV"
                 if not quiet:
-                    print(f"  🔒 Fixed strike from CSV: {fixed_strike}")
+                    print(f"  🔒 Fixed strike from {label}: {fixed_strike}")
             else:
                 fixed_strike     = None
                 day_first_strike = None
@@ -347,35 +512,31 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     return None
 
             # ── Per-day state ──────────────────────────────────────────────────
-            active         = None
-            day_trades     = []
-            reentry_after  = None   # naive datetime — gate for re-entries
+            active        = None
+            day_trades    = []
+            reentry_after = None
 
             for _, spot_row in spot_day.iterrows():
                 candle_dt      = pd.to_datetime(spot_row['datetime'])
                 candle_time    = candle_dt.time()
                 is_exit_candle = (candle_time == time(15, 15))
 
-                # ── Determine strike ───────────────────────────────────────────
-                if source == 'csv':
+                # Strike for this candle
+                if source in ('injected', 'csv'):
                     strike_to_use = fixed_strike
                 else:
                     if day_first_strike is None:
                         day_first_strike = _atm(spot_open)
                         if not quiet:
-                            print(f"  🔒 Fixed strike from DB (first candle): "
-                                  f"{day_first_strike}")
+                            print(f"  🔒 Fixed strike from DB (first candle): {day_first_strike}")
                     strike_to_use = day_first_strike
 
-                # ── Open trade (initial or re-entry) ──────────────────────────
+                # ── Open trade ─────────────────────────────────────────────────
                 if active is None:
-                    # Honour re-entry gate — skip candles that start before
-                    # the next bar boundary computed after the last exit
                     if reentry_after is not None:
-                        candle_naive = candle_dt.replace(tzinfo=None)
-                        if candle_naive < reentry_after:
+                        if candle_dt.replace(tzinfo=None) < reentry_after:
                             continue
-                    reentry_after = None   # gate cleared — proceed to open
+                    reentry_after = None
 
                     ce_c = get_candle(candle_dt, strike_to_use, 'CALL')
                     pe_c = get_candle(candle_dt, strike_to_use, 'PUT')
@@ -408,9 +569,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                               f"PE {strike_to_use} @ {active['pe_entry']:.2f}  "
                               f"SL {active['pe_sl']:.2f}  Tgt {active['pe_target']:.2f}")
 
-                    # Fall through — check SL/Target on entry candle immediately
-
-                # ── Fetch current candles for active trade ─────────────────────
+                # ── Fetch current candle data ───────────────────────────────────
                 ce_c = get_candle(candle_dt, active['ce_strike'], 'CALL')
                 pe_c = get_candle(candle_dt, active['pe_strike'], 'PUT')
                 if ce_c is None or pe_c is None:
@@ -425,7 +584,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 pe_low    = float(pe_c['low'])
                 pe_close  = float(pe_c['close'])
 
-                # ── Per-candle status display ──────────────────────────────────
+                # ── Per-candle status ──────────────────────────────────────────
                 if not quiet:
                     ce_live_pts    = active['ce_entry'] - ce_close
                     pe_live_pts    = active['pe_entry'] - pe_close
@@ -441,13 +600,11 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     )
 
                 exit_reason = None
-                ce_exit_px  = None
-                pe_exit_px  = None
-                ce_pnl_pts  = None
-                pe_pnl_pts  = None
+                ce_exit_px  = ce_pnl_pts = None
+                pe_exit_px  = pe_pnl_pts = None
                 do_reenter  = False
 
-                # ── Time exit — actual close prices ────────────────────────────
+                # ── Time exit ─────────────────────────────────────────────────
                 if is_exit_candle:
                     exit_reason = 'Time'
                     ce_exit_px  = ce_close
@@ -456,72 +613,51 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     pe_pnl_pts  = _leg_pnl_time(active['pe_entry'], pe_exit_px)
 
                 else:
-                    # ── Per-leg SL: HIGH of candle crosses that leg's SL ───────
-                    sl_hit_ce = ce_high >= active['ce_sl']
-                    sl_hit_pe = pe_high >= active['pe_sl']
-                    sl_hit    = sl_hit_ce or sl_hit_pe
-
-                    # ── Per-leg Target: LOW of candle crosses that leg's target ─
+                    sl_hit_ce  = ce_high >= active['ce_sl']
+                    sl_hit_pe  = pe_high >= active['pe_sl']
+                    sl_hit     = sl_hit_ce or sl_hit_pe
                     tgt_hit_ce = ce_low <= active['ce_target']
                     tgt_hit_pe = pe_low <= active['pe_target']
                     target_hit = tgt_hit_ce or tgt_hit_pe
 
                     if target_hit and sl_hit:
-                        # ── Conflict on same leg (e.g. CE high hit SL AND CE low
-                        #    hit target in the same candle). Use open-proximity:
-                        #    whichever trigger was closer to candle open happened first.
-                        # Cross-leg conflict (CE SL + PE target or vice-versa) is
-                        # NOT a real conflict — they are independent legs. We check
-                        # which leg actually had both triggers on the same candle.
-                        same_leg_conflict = (sl_hit_ce and tgt_hit_ce) or (sl_hit_pe and tgt_hit_pe)
-
-                        if same_leg_conflict:
-                            # Determine distance from open to each trigger
+                        same_leg = (sl_hit_ce and tgt_hit_ce) or (sl_hit_pe and tgt_hit_pe)
+                        if same_leg:
                             if sl_hit_ce and tgt_hit_ce:
                                 dist_sl  = active['ce_sl']     - ce_open_c
                                 dist_tgt = ce_open_c - active['ce_target']
                             else:
                                 dist_sl  = active['pe_sl']     - pe_open_c
                                 dist_tgt = pe_open_c - active['pe_target']
-
                             exit_reason = 'SL' if dist_sl <= dist_tgt else 'Target'
                             if not quiet:
                                 print(f"  ⚡ Conflict at {candle_dt.strftime('%H:%M')} — "
                                       f"dist_sl={dist_sl:.2f}  dist_tgt={dist_tgt:.2f}  "
                                       f"→ {exit_reason} wins")
                         else:
-                            # Different legs triggered SL and Target independently.
-                            # SL takes priority (conservative).
                             exit_reason = 'SL'
                             if not quiet:
                                 print(f"  ⚡ Cross-leg at {candle_dt.strftime('%H:%M')} — "
-                                      f"SL on one leg, Target on other → SL wins")
+                                      "SL on one leg, Target on other → SL wins")
                         do_reenter = True
 
                     elif target_hit:
                         exit_reason = 'Target'
                         do_reenter  = True
-
                     elif sl_hit:
                         exit_reason = 'SL'
                         do_reenter  = True
 
-                    # ── Fixed PnL for SL/Target ────────────────────────────────
                     if exit_reason == 'Target':
                         ce_exit_px = active['ce_entry'] - target_points
                         pe_exit_px = active['pe_entry'] - target_points
-                        ce_cost    = _leg_cost(active['ce_entry'], ce_exit_px)
-                        pe_cost    = _leg_cost(active['pe_entry'], pe_exit_px)
-                        ce_pnl_pts = target_points - ce_cost
-                        pe_pnl_pts = target_points - pe_cost
-
+                        ce_pnl_pts = target_points - _leg_cost(active['ce_entry'], ce_exit_px)
+                        pe_pnl_pts = target_points - _leg_cost(active['pe_entry'], pe_exit_px)
                     elif exit_reason == 'SL':
                         ce_exit_px = active['ce_sl']
                         pe_exit_px = active['pe_sl']
-                        ce_cost    = _leg_cost(active['ce_entry'], ce_exit_px)
-                        pe_cost    = _leg_cost(active['pe_entry'], pe_exit_px)
-                        ce_pnl_pts = -sl_points - ce_cost
-                        pe_pnl_pts = -sl_points - pe_cost
+                        ce_pnl_pts = -sl_points - _leg_cost(active['ce_entry'], ce_exit_px)
+                        pe_pnl_pts = -sl_points - _leg_cost(active['pe_entry'], pe_exit_px)
 
                 if exit_reason:
                     ce_pnl_val = ce_pnl_pts * LOT_SIZE
@@ -556,27 +692,20 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     active = None
 
                     if not quiet:
-                        icon = ("🎯" if exit_reason == 'Target' else
-                                "🔴" if exit_reason == 'SL' else "🏁")
+                        icon = "🎯" if exit_reason == 'Target' else \
+                               "🔴" if exit_reason == 'SL' else "🏁"
                         print(f"  {icon} TRADE #{record['trade_num']} CLOSED | "
                               f"{exit_reason} | "
-                              f"CE entry {prev_active['ce_entry']:.2f} "
-                              f"exit {ce_exit_px:.2f}  "
-                              f"PE entry {record['pe_entry']:.2f} "
-                              f"exit {pe_exit_px:.2f} | "
+                              f"CE entry {prev_active['ce_entry']:.2f} exit {ce_exit_px:.2f}  "
+                              f"PE entry {record['pe_entry']:.2f} exit {pe_exit_px:.2f} | "
                               f"Trade PnL: ₹{trade_val:+.2f} "
                               f"({'fixed ±pts' if exit_reason != 'Time' else 'actual prices'})")
 
                     if not do_reenter:
-                        break   # time exit — done for this day
-                    # Compute re-entry gate exactly as live strategy does:
-                    # next bar boundary on the TF_SECONDS grid after exit candle.
-                    # Then continue to next candle — never re-enter on the same
-                    # candle that just triggered an exit.
-                    candle_naive  = candle_dt.replace(tzinfo=None)
+                        break
                     reentry_after = _next_bar_open(
-                        candle_naive, entry_h, entry_m, tf_seconds)
-                    continue  # skip to next candle — no same-candle re-entry
+                        candle_dt.replace(tzinfo=None), entry_h, entry_m, tf_seconds)
+                    continue
 
             # ── Daily PnL ──────────────────────────────────────────────────────
             day_pnl = sum(t['trade_pnl_val'] for t in day_trades)
@@ -620,13 +749,10 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
             if len(res_df) > 1:
                 res_df['date'] = pd.to_datetime(res_df['date'])
                 monthly = (res_df.set_index('date')
-                                 .resample('ME')['pnl_value']
-                                 .sum()
-                                 .reset_index())
+                                 .resample('ME')['pnl_value'].sum().reset_index())
                 monthly['Year']  = monthly['date'].dt.year
                 monthly['Month'] = monthly['date'].dt.strftime('%b')
-                pivot = monthly.pivot(index='Year', columns='Month',
-                                      values='pnl_value')
+                pivot = monthly.pivot(index='Year', columns='Month', values='pnl_value')
                 month_order = ['Jan','Feb','Mar','Apr','May','Jun',
                                'Jul','Aug','Sep','Oct','Nov','Dec']
                 pivot = pivot.reindex(columns=month_order)
@@ -651,12 +777,10 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                     if m in pivot_pct.columns:
                         pivot_pct[m] = pivot_pct[m].apply(
                             lambda v: f"{v:.2f} ({(v/base_capital)*100:.2f}%)"
-                            if isinstance(v, (int, float)) else v
-                        )
+                            if isinstance(v, (int, float)) else v)
                 pivot_pct['MDD'] = pivot_pct['MDD'].apply(
                     lambda v: f"{v:.2f} ({(v/base_capital)*100:.2f}%)"
-                    if isinstance(v, (int, float)) else v
-                )
+                    if isinstance(v, (int, float)) else v)
                 pivot_pct.to_csv('monthly_pnl_matrix.csv')
                 print("  Monthly matrix → monthly_pnl_matrix.csv")
 
@@ -670,8 +794,7 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 plt.subplot(2, 1, 2)
                 plt.fill_between(res_df['date'], res_df['drawdown'], 0,
                                  color='red', alpha=0.3, label='Drawdown')
-                plt.plot(res_df['date'], res_df['drawdown'],
-                         color='red', alpha=0.6)
+                plt.plot(res_df['date'], res_df['drawdown'], color='red', alpha=0.6)
                 plt.title('Drawdown Curve')
                 plt.ylabel('Drawdown (₹)'); plt.xlabel('Date')
                 plt.grid(True); plt.legend()
@@ -680,7 +803,6 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
                 print("  Chart → backtest_performance.png")
 
             print_trade_summary(completed_trades)
-
     else:
         if not quiet:
             print("No trades generated.")
@@ -688,26 +810,105 @@ def run_backtest(entry_time_str='09:16', sl_points=SL_POINTS,
     return res_df, completed_trades
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI  —  smart arg parser handles both modes in one file
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Short Straddle Backtest (Fixed SL/Target Points)',
-        formatter_class=argparse.RawTextHelpFormatter
+        description=(
+            "Short Straddle Backtest\n\n"
+            "MODE 1 — Live fetch + backtest (--strike and --start and --end all required):\n"
+            "  python backtest.py --date 2026-03-17 --strike 23450 --start 11:36 --end 13:06\n\n"
+            "MODE 2 — Classic CSV/DB backtest (original behaviour):\n"
+            "  python backtest.py --date 2026-03-17\n"
+            "  python backtest.py --time 09:20 --sl 40\n"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument('--time', type=str, default='09:16',
-                        help='Entry time HH:MM (default 09:16)')
-    parser.add_argument('--sl', type=int, default=SL_POINTS,
+
+    # Live-fetch flags (Mode 1)
+    parser.add_argument('--strike', type=float, default=None,
+                        help='[Mode 1] Strike price  e.g. 23450')
+    parser.add_argument('--start',  type=str,   default=None,
+                        help='[Mode 1] Data/entry start time  HH:MM')
+    parser.add_argument('--end',    type=str,   default=None,
+                        help='[Mode 1] Data end time  HH:MM')
+
+    # Shared flags
+    parser.add_argument('--date',   type=str,   default=None,
+                        help='Trading date YYYY-MM-DD')
+    parser.add_argument('--sl',     type=int,   default=SL_POINTS,
                         help=f'SL points per leg (default {SL_POINTS})')
-    parser.add_argument('--target', type=int, default=TARGET_POINTS,
+    parser.add_argument('--target', type=int,   default=TARGET_POINTS,
                         help=f'Target points per leg (default {TARGET_POINTS})')
-    parser.add_argument('--date', type=str, default=None,
-                        help='Filter to single date YYYY-MM-DD (default: all dates)')
-    parser.add_argument('--tf', type=int, default=TF_SECONDS,
-                        help=f'Re-entry bar size in seconds (default {TF_SECONDS})')
+    parser.add_argument('--tf',     type=int,   default=TF_SECONDS,
+                        help=f'Re-entry bar size seconds (default {TF_SECONDS})')
+    parser.add_argument('--quiet',  action='store_true',
+                        help='Suppress per-candle log output')
+
+    # Mode 2 only
+    parser.add_argument('--time',   type=str,   default=None,
+                        help='[Mode 2] Entry time HH:MM (default 09:16); '
+                             'in Mode 1 --start is used instead')
+
     args = parser.parse_args()
-    run_backtest(
-        entry_time_str=args.time,
-        sl_points=args.sl,
-        target_points=args.target,
-        date_filter=args.date,
-        tf_seconds=args.tf,
-    )
+
+    # ── Detect mode ────────────────────────────────────────────────────────────
+    live_flags = [args.strike, args.start, args.end]
+    any_live   = any(f is not None for f in live_flags)
+    all_live   = all(f is not None for f in live_flags)
+
+    if any_live:
+        # ── MODE 1 — Live fetch ────────────────────────────────────────────────
+        if not all_live:
+            missing = [n for n, v in [('--strike', args.strike),
+                                       ('--start',  args.start),
+                                       ('--end',    args.end)] if v is None]
+            parser.error(
+                f"Live fetch mode requires --strike, --start, and --end.\n"
+                f"Missing: {', '.join(missing)}"
+            )
+        if args.date is None:
+            parser.error("--date is required in live fetch mode.")
+
+        # Validate formats
+        try:
+            datetime.strptime(args.date,  '%Y-%m-%d')
+        except ValueError:
+            parser.error("--date must be YYYY-MM-DD")
+        for flag, val in [('--start', args.start), ('--end', args.end)]:
+            try:
+                datetime.strptime(val, '%H:%M')
+            except ValueError:
+                parser.error(f"{flag} must be HH:MM")
+        if datetime.strptime(args.start, '%H:%M') >= datetime.strptime(args.end, '%H:%M'):
+            parser.error("--start must be earlier than --end")
+
+        live_df = fetch_data_in_memory(
+            trade_date=args.date,
+            strike=args.strike,
+            start_time=args.start,
+            end_time=args.end,
+        )
+        run_backtest(
+            entry_time_str=args.start,
+            sl_points=args.sl,
+            target_points=args.target,
+            date_filter=args.date,
+            tf_seconds=args.tf,
+            quiet=args.quiet,
+            injected_df=live_df,
+        )
+
+    else:
+        # ── MODE 2 — Classic CSV / DuckDB ─────────────────────────────────────
+        entry_time = args.time if args.time else '09:16'
+        run_backtest(
+            entry_time_str=entry_time,
+            sl_points=args.sl,
+            target_points=args.target,
+            date_filter=args.date,
+            tf_seconds=args.tf,
+            quiet=args.quiet,
+        )
